@@ -108,6 +108,21 @@ void ConfigManager::ApplyEnvOverrides() {
       num_threads_ = static_cast<u32>(n);
     }
   }
+
+  // CLIO_CLIENT_BUSY_WAIT_US: how long a client spins in Future::Wait before
+  // parking (issue #784). Belongs here, not in ParseYAML: LoadDefault and
+  // ParseYAML are alternatives, and a client process with no config file only
+  // runs the former — an override placed in ParseYAML alone is silently dead on
+  // exactly the processes this knob targets. ClientInit calls this
+  // unconditionally, so env wins over both yaml and the default. 0 is a
+  // meaningful value (park immediately), so accept it.
+  if (const char *env = clio::run::env::GetCompat("CLIENT_BUSY_WAIT_US")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env) {
+      client_busy_wait_ = static_cast<u32>(n);
+    }
+  }
 }
 
 bool ConfigManager::ServerInit() {
@@ -260,6 +275,7 @@ void ConfigManager::LoadDefault() {
 
   // Set default worker sleep configuration (in microseconds)
   first_busy_wait_ = 1000;             // 1000us busy wait
+  client_busy_wait_ = 0;               // client-side spin off by default (#784)
   max_sleep_ = 50000;                  // 50000us (50ms) maximum sleep
 
   // Set default task load prediction model learning rate
@@ -290,6 +306,11 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Worker sleep configuration
     if (runtime["first_busy_wait"]) {
       first_busy_wait_ = runtime["first_busy_wait"].as<u32>();
+    }
+
+    // Client-side spin-before-park window (issue #784)
+    if (runtime["client_busy_wait"]) {
+      client_busy_wait_ = runtime["client_busy_wait"].as<u32>();
     }
 
     // Periodic cross-node task-validity check interval (issue #628)

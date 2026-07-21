@@ -12,6 +12,9 @@
 
 #include <unordered_map>
 
+#include "clio_ctp/thread/thread_model_manager.h"
+#include "clio_runtime/config_manager.h"
+
 namespace clio::run {
 
 // NOTE (SHM refactor): the thread-local ShmOutResponseStash that used to demux
@@ -111,21 +114,86 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   const size_t want_key = task_ptr->task_id_.net_key_;
 
-  // Block on this thread's EventManager until RecvShmClientThread marks this
-  // task complete and signals us (SHM analogue of IpcCpu2CpuZmq::RecvOut). The
-  // dedicated recv thread — not this thread — drains the single response ring,
-  // so app threads no longer poll a per-thread ring or demux siblings here. The
-  // 100us bounded Wait is a missed-signal / timeout safety re-check; the named
-  // auto-reset event latches a Signal that races the Wait.
+  // Wait for RecvShmClientThread to mark this task complete and signal us (SHM
+  // analogue of IpcCpu2CpuZmq::RecvOut). The dedicated recv thread — not this
+  // thread — drains the single response ring, so app threads no longer poll a
+  // per-thread ring or demux siblings here.
   ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   ctp::Timepoint start;
   start.Now();
+  const double timeout_us =
+      (max_sec > 0) ? static_cast<double>(max_sec) * 1e6 : 0;
+
+  // Phase 1 — spin (issue #784).
+  //
+  // This is the last hop on the request path that parked unconditionally. The
+  // runtime's workers busy-wait first_busy_wait (1ms) before sleeping, and both
+  // SHM ring drainers spin kShmSpinBudget iterations before parking, but the
+  // waiter itself went straight into epoll. So every single round trip paid a
+  // tgkill -> signalfd -> epoll wake plus a scheduler round trip on the
+  // response side — tens of microseconds on a path whose actual work is a few
+  // microseconds, which is most of the ~5-6us -> 50-70us regression the
+  // single-ring refactor (#780) introduced.
+  //
+  // Spinning here is safe against a lost wakeup: SIGUSR1 is blocked on this
+  // thread (the EventManager ctor's AddSignalEvent), so a Signal that lands
+  // while we spin stays pending on the signalfd and would make a later Wait()
+  // return immediately. The loop condition is IsComplete() either way.
+  //
+  // The spin escalates rather than burning a core for the whole window:
+  //
+  //   0 .. kPauseWindowUs   CTP_THREAD_MODEL->Yield(), a CPU pause hint (~20ns)
+  //                         that does NOT release the core. See the comment on
+  //                         ThreadModel::Yield in thread_model/pthread.h, where
+  //                         a 100ns nanosleep on this path was measured to
+  //                         actually sleep ~54us and inflate single-RTT SHM
+  //                         latency from ~1us to ~58us. Anything that can block
+  //                         belongs nowhere near this window.
+  //   .. spin_us            sched_yield, which releases the core to any other
+  //                         runnable thread but leaves us in the run queue.
+  //
+  // The escalation matters because the spinner is not alone: on a SHM round
+  // trip the runtime's workers are also busy-waiting (first_busy_wait) and both
+  // ring drainers are spinning their budget. On an oversubscribed host those
+  // plus N spinning clients exceed the core count, and a pure pause loop
+  // starves the very workers that must produce our response — the same
+  // livelock Worker::SuspendMe documents for the CI runners. kPauseWindowUs
+  // sits comfortably above the measured SHM round trip (~28us), so the common
+  // case completes in the pause phase and never reaches sched_yield.
+  //
+  // The clock is only read every kSpinClockMask+1 iterations so the timing
+  // check does not dominate the pause phase.
+  auto *config = CLIO_CONFIG_MANAGER;
+  const double spin_us = static_cast<double>(config->GetClientBusyWait());
+  if (spin_us > 0 && !task_ptr->IsComplete()) {
+    constexpr size_t kSpinClockMask = 63;
+    constexpr double kPauseWindowUs = 50.0;
+    ctp::Timepoint now;
+    bool pause_phase = true;
+    for (size_t i = 0; !task_ptr->IsComplete(); ++i) {
+      if (!pause_phase || (i & kSpinClockMask) == kSpinClockMask) {
+        now.Now();
+        double elapsed = start.GetUsecFromStart(now);
+        if (elapsed >= spin_us) break;
+        if (timeout_us > 0 && elapsed >= timeout_us) return false;
+        pause_phase = elapsed < kPauseWindowUs;
+      }
+      if (pause_phase) {
+        CTP_THREAD_MODEL->Yield();      // pause hint, keeps the core
+      } else {
+        ctp::SystemInfo::YieldThread();  // sched_yield, releases the core
+      }
+    }
+  }
+
+  // Phase 2 — park. The 100us bounded Wait is a missed-signal / timeout safety
+  // re-check; the named auto-reset event latches a Signal that races the Wait.
   while (!task_ptr->IsComplete()) {
     em->Wait(100);
-    if (max_sec > 0) {
+    if (timeout_us > 0) {
       ctp::Timepoint now;
       now.Now();
-      if (start.GetUsecFromStart(now) >= static_cast<double>(max_sec) * 1e6) {
+      if (start.GetUsecFromStart(now) >= timeout_us) {
         return false;
       }
     }

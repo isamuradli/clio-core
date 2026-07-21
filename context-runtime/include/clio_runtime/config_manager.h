@@ -268,6 +268,25 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetFirstBusyWait() const { return first_busy_wait_; }
 
   /**
+   * Get the client-side busy-wait window in microseconds (issue #784).
+   *
+   * How long a client thread blocked in Future::Wait() spins on the task's
+   * completion flag before it parks on its EventManager. This is the client
+   * mirror of first_busy_wait: the runtime's workers and the SHM ring drainers
+   * both stay hot for a while before sleeping, but the waiter itself used to
+   * park unconditionally, putting a tgkill -> signalfd -> epoll wake on the
+   * critical path of EVERY request. Overridable via CLIO_CLIENT_BUSY_WAIT_US.
+   *
+   * Defaults to 0 (park immediately, the pre-#784 behavior) because the trade
+   * is not free — see the measurements in the commit message: 1ms of spin cut
+   * single-thread SHM round-trip latency 2.2-2.4x, but cost ~45% throughput at
+   * 4 client threads on a 6-core host, where the spinners compete with the
+   * runtime workers that must produce their responses.
+   * @return Spin window in us (default: 0 = disabled)
+   */
+  u32 GetClientBusyWait() const { return client_busy_wait_; }
+
+  /**
    * Get the task-progress validity-check interval in milliseconds.
    *
    * How long an outstanding cross-node task may sit quietly before the origin
@@ -390,6 +409,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
+  u32 client_busy_wait_ = 0;                 // Default: off — see GetClientBusyWait
   // #628 task-progress probe (0 = disabled). ON by default (issue #774): this
   // probe is the ONLY recovery for a cross-node task whose response was lost
   // (e.g. the SendOut retry queue timing out under sustained back-pressure) —
