@@ -458,6 +458,9 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   if (!is_initialized_) {
     return nullptr;
   }
+  // May be called from a worker thread (group dedication) as well as the
+  // monitor thread (stall rescue).
+  std::lock_guard<std::mutex> spawn_lk(spawn_mtx_);
   if (all_workers_.size() >= all_workers_.capacity()) {
     HLOG(kWarning,
          "[#785] elastic worker cap reached ({} workers); refusing to spawn. "

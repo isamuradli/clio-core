@@ -35,6 +35,7 @@
 #define CLIO_RUNTIME_INCLUDE_WORKERS_WORK_ORCHESTRATOR_H_
 
 #include <atomic>
+#include <mutex>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -248,6 +249,12 @@ class WorkOrchestrator {
   // issue #785: workers created at Init. Anything at or beyond this index is an
   // elastic replacement and is eligible for reuse.
   size_t baseline_worker_count_ = 0;
+
+  // issue #785: SpawnAdditionalWorker used to be monitor-thread-only. Dedicated
+  // group workers are allocated from RuntimeMapTask, i.e. from WORKER threads,
+  // so two threads binding two groups at once would race on the push_backs
+  // below. The reserve prevents reallocation but not concurrent size updates.
+  std::mutex spawn_mtx_;
 
   // Active lanes pointer to IPC Manager worker queues
   void* active_lanes_;

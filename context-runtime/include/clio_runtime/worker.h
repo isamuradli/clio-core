@@ -172,6 +172,26 @@ class Worker {
    */
   u32 GetId() const;
 
+  /**
+   * issue #785: the TaskGroup this worker is dedicated to, or -1 for a general
+   * worker.
+   *
+   * A group is a commitment from the caller that its tasks may share one
+   * worker, head-of-line blocking included. The runtime honours that by giving
+   * the group a worker of its OWN: general work is never routed here, so the
+   * group's serialisation is confined to the group. It is also why a group
+   * binding is permanent — nothing else runs here, so there is never a reason
+   * to move it, and a task that owns a thread-bound resource (a ZMQ socket)
+   * keeps it on one thread for the process lifetime by construction.
+   */
+  int64_t DedicatedGroup() const {
+    return dedicated_group_.load(std::memory_order_acquire);
+  }
+  void SetDedicatedGroup(int64_t g) {
+    dedicated_group_.store(g, std::memory_order_release);
+  }
+  bool IsDedicated() const { return DedicatedGroup() != -1; }
+
   /** OS thread id of this worker (valid once Run() has started). #642 */
   u32 GetTid() const { return tid_.load(std::memory_order_acquire); }
 
@@ -592,6 +612,8 @@ class Worker {
   // reads it on the monitor thread to republish lane ownership. TSan flagged
   // the plain u32.
   std::atomic<u32> tid_{0};  /**< OS thread id, set in Run() (#642) */
+  // issue #785: TaskGroup this worker serves exclusively, or -1.
+  std::atomic<int64_t> dedicated_group_{-1};
   // issue #785: atomic — Stop() is called from another thread while Run()
   // polls it. TSan flagged the plain bool.
   std::atomic<bool> is_running_;
