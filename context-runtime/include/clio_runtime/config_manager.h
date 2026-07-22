@@ -170,6 +170,15 @@ class ConfigManager : public ctp::BaseConfig {
     // that may never be spawned. Rescues are rare and replacements are
     // recycled, so a modest fixed ceiling is enough: the pool only ever needs
     // as many replacements as there are workers wedged AT ONCE.
+    //
+    // CAVEAT: GetCpuCount() reports the MACHINE's cores, not the cores this
+    // process may actually use. Under taskset or a cgroup CPU limit — i.e. most
+    // containers and CI runners — it over-counts, so the elastic budget can
+    // exceed the usable parallelism it is meant to track. Measured: a run
+    // pinned to 2 cores still reported "6 cores" here. That makes the cap
+    // looser than intended rather than unsafe, and the fixed ceiling below
+    // bounds the damage; a cgroup/affinity-aware count would belong in
+    // ctp::SystemInfo rather than here.
     static constexpr u32 kMaxElasticLanes = 8;
     int ncpu = ctp::SystemInfo::GetCpuCount();
     u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : 8;
