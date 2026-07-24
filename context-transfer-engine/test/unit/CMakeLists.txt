@@ -1161,6 +1161,74 @@ set_tests_properties(
     PROPERTIES TIMEOUT 120
 )
 
+# ------------------------------------------------------------------------------
+# clio-fs zero-IPC read path (issue #817): correctness + latency
+#
+# UNIX-only, like the cfs adapter it drives: cfs_io.h is built on unistd.h /
+# sys/stat.h / off_t and has no Windows port, so clio_cte_cfs_adapter does not
+# exist there.
+# ------------------------------------------------------------------------------
+if(UNIX)
+add_executable(test_cfs_shm_read
+    test_cfs_shm_read.cc
+)
+
+target_include_directories(test_cfs_shm_read PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+# Spawns its own clio_run daemon (RuntimeServer) and composes it from YAML, so
+# the fast path is exercised across a real process boundary. A co-located
+# runtime cannot prove that -- it shares the address space and hand-registers
+# its targets, which is precisely how the production-dead locality check
+# (issue #817) stayed invisible.
+target_compile_definitions(test_cfs_shm_read PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+target_link_libraries(test_cfs_shm_read
+    clio_cte_cfs_adapter
+    clio_cte_filesystem_client
+    clio_cte_core_client
+    # The client library's Config helpers are defined in the RUNTIME library,
+    # so it has to come after the client on the link line: this binary calls
+    # nothing in it directly, and --as-needed would otherwise drop it before
+    # the client's undefined reference is even seen.
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# The co-located runtime dlopens the chimods from CLIO_REPO_PATH.
+add_dependencies(test_cfs_shm_read
+    clio_run
+    clio_cte_core_runtime
+    clio_cte_filesystem_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+
+add_test(NAME cfs_shm_read
+    COMMAND test_cfs_shm_read
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# This test spawns a live daemon, so it inherits the macOS caveat from the CLI
+# live-runtime tests (issue #482): the local ZMQ DEALER->ROUTER control plane
+# does not deliver ClientConnect replies on the macOS runners, so drive the
+# client over the unix-socket IPC transport there.
+set(_cfs_shm_read_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+if(APPLE)
+  string(APPEND _cfs_shm_read_env ";CLIO_IPC_MODE=ipc")
+endif()
+
+set_tests_properties(cfs_shm_read PROPERTIES
+    ENVIRONMENT "${_cfs_shm_read_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "unit;cte;cfs;msan_skip")
+endif()  # UNIX
+
 add_executable(test_cte_gpu_metadata_cache
     test_cte_gpu_metadata_cache.cc
 )

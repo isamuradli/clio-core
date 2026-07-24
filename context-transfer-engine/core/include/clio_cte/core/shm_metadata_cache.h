@@ -49,13 +49,23 @@ using ShmCacheString = ctp::ipc::string<ShmCacheAlloc>;
 /**
  * Maximum blocks stored inline in a cached blob record.
  *
- * Deliberately small and FIXED. The fast path exists for SMALL blobs (design
- * §5.3: for a 1 GB blob a 72 us round-trip is already noise), and a small blob
- * has few blocks. Capping the block list keeps the record a plain POD with no
- * nested allocation and no second pointer chase for a lock-free reader; a blob
- * with more blocks than this simply is not cacheable and takes the RPC path.
+ * FIXED, because capping the block list keeps the record a plain POD with no
+ * nested allocation and no second pointer chase for a lock-free reader.
+ *
+ * SIZED AGAINST THE ALLOCATOR, NOT AGAINST "small blobs" (issue #817). The
+ * CTE caps every physical block at kMaxBlockChunk = 64 KB (core_runtime.cc,
+ * ExtendBlob) so that freed extents can be reused under fragmentation, which
+ * means block count scales with blob SIZE: a 1 MiB blob is 16 blocks, not one.
+ * At the original value of 8 every blob above 512 KB was marked truncated and
+ * refused -- including every clio-fs page, since kFsPageSize is exactly 1 MiB.
+ * 16 covers a full page.
+ *
+ * The cost is resident: each block descriptor is 32 B, so this is +256 B per
+ * cached blob (the table is preallocated, see ShmMetadataCacheRoot). Raising it
+ * further to chase larger blobs is the wrong trade -- the round-trip it saves
+ * is already noise next to the memcpy at that size.
  */
-static constexpr clio::run::u32 kMaxInlineBlocks = 8;
+static constexpr clio::run::u32 kMaxInlineBlocks = 16;
 
 /**
  * One block of a cached blob.
@@ -80,8 +90,9 @@ enum ShmBlobFlags : clio::run::u32 {
   /** Every block is node-local AND RAM-backed, so the payload is directly
    *  readable from shared memory. Without this the client must use RPC. */
   kShmBlobDirectReadable = 1u << 0,
-  /** The blob had more blocks than kMaxInlineBlocks, so blocks_ is truncated
-   *  and MUST NOT be used for a payload read. */
+  /** The blob had more blocks than kMaxInlineBlocks, so blocks_ describes only
+   *  a PREFIX of it. Reads bounded by CoveredBytes() are still served; reads
+   *  past the prefix must fall back to RPC. */
   kShmBlobTruncated = 1u << 1,
 };
 
@@ -122,10 +133,30 @@ struct ShmBlobRecord {
         num_blocks_(0),
         reserved_(0) {}
 
-  /** True if the payload may be read directly out of shared memory. */
+  /**
+   * True if the payload may be read directly out of shared memory.
+   *
+   * A TRUNCATED record still qualifies (issue #817). The cached blocks are the
+   * blob's first blocks in logical order, so they describe a known prefix
+   * exactly; refusing the whole blob threw away complete information about the
+   * part it did have. Callers must bound the read by CoveredBytes(), not by
+   * total_size_ -- that is what keeps a truncated record safe.
+   */
   bool IsDirectReadable() const {
-    return (flags_ & kShmBlobDirectReadable) != 0 &&
-           (flags_ & kShmBlobTruncated) == 0 && num_blocks_ > 0;
+    return (flags_ & kShmBlobDirectReadable) != 0 && num_blocks_ > 0;
+  }
+
+  /**
+   * Logical bytes described by the cached blocks: the length of the prefix of
+   * this blob that can be read from shared memory. Equals total_size_ unless
+   * the record is truncated.
+   */
+  clio::run::u64 CoveredBytes() const {
+    clio::run::u64 n = 0;
+    for (clio::run::u32 i = 0; i < num_blocks_ && i < kMaxInlineBlocks; ++i) {
+      n += blocks_[i].size_;
+    }
+    return n;
   }
 };
 
@@ -168,7 +199,10 @@ using ShmBlobInfoMap =
 struct ShmMetadataCacheRoot {
   /** Layout version. A client that does not recognize it must not attach --
    *  the cache is derived state, so refusing is always safe. */
-  static constexpr clio::run::u32 kLayoutVersion = 1;
+  // v2 (issue #817): kMaxInlineBlocks 8 -> 16, and a truncated record is now
+  // readable up to CoveredBytes(). Both change the record layout/semantics, so
+  // a v1 client must refuse rather than misread it.
+  static constexpr clio::run::u32 kLayoutVersion = 2;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */

@@ -53,11 +53,6 @@ inline std::string MakeDataBlobId(clio::run::u32 node_id, clio::run::u64 logical
  */
 constexpr const char *kDirMarker = ".__clio_dir__";
 
-/** Page name for a byte offset (1 MiB pages, stringified index — libfuse). */
-inline std::string PageName(clio::run::u64 off) {
-  return std::to_string(off / kFsPageSize);
-}
-
 /** Strip a single trailing '/' from a path (keeping a bare root "/"). */
 inline std::string StripTrailingSlash(std::string p) {
   if (p.size() > 1 && p.back() == '/') p.pop_back();
@@ -221,11 +216,81 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       xattr_tag_id_ = xt->tag_id_;
     }
   }
+  // issue #817: bring up the shared-memory attribute mirror, so clients can
+  // resolve path -> {tag id, logical size} without a round trip and then read
+  // page blobs straight out of the RAM bdev segment.
+  //
+  // Capacity is PERMANENT (the SHM map never rehashes -- a rehash would free a
+  // table out from under untracked cross-process readers) and RESIDENT: every
+  // slot is constructed up front, at ~112 B per entry, so the 64K default is
+  // ~7 MB. Paths beyond capacity are simply not mirrored and keep using RPC.
+  {
+    size_t capacity = 64 * 1024;
+    if (const char *env = clio::run::env::GetCompat("CFS_SHM_FILE_CAPACITY")) {
+      char *end = nullptr;
+      unsigned long long v = std::strtoull(env, &end, 10);
+      if (end != env && v > 0) {
+        capacity = static_cast<size_t>(v);
+      }
+    }
+    if (shm_fs_cache_.Create(capacity, task->new_pool_id_)) {
+      HLOG(kInfo,
+           "filesystem: shared-memory attribute cache enabled (files={}, "
+           "root_off={})",
+           capacity, shm_fs_cache_.RootOffset());
+    } else {
+      HLOG(kInfo,
+           "filesystem: shared-memory attribute cache disabled (no metadata "
+           "segment) -- clients will use the RPC path");
+    }
+  }
+
   HLOG(kInfo, "filesystem: Create over CTE core pool {}",
        next_pool_id_.ToString());
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+// ---- issue #817: shared-memory attribute mirror --------------------------
+//
+// Both helpers are best-effort and must never affect the caller's result: the
+// mirror is derived state, so the correct response to any problem is to stop
+// mirroring, not to fail the filesystem operation in progress.
+//
+// LOCKING: the caller must hold meta_mu_ when the FileInfo's override fields
+// (set_mode_/set_uid_/set_gid_/set_atime_/...) are live, since those are
+// guarded by it. size_ is atomic and safe to read either way.
+
+void Runtime::MirrorFile(const std::string &path, const FileInfo &fi,
+                         clio::run::u32 extra_flags) {
+  if (!shm_fs_cache_.IsEnabled()) {
+    return;
+  }
+  ShmFileRecord rec;
+  rec.tag_id_ = fi.tag_id_;
+  rec.size_ = fi.size_.load();
+  rec.ino_ = InoFromTag(fi.tag_id_);
+  rec.ov_atime_ns_ = fi.set_atime_;
+  rec.ov_mtime_ns_ = fi.set_mtime_;
+  rec.ov_ctime_ns_ = fi.set_ctime_;
+  rec.mode_ = fi.set_mode_;
+  rec.uid_ = fi.set_uid_;
+  rec.gid_ = fi.set_gid_;
+  rec.flags_ = kShmFileExists | extra_flags;
+  shm_fs_cache_.PutFile(path, rec);
+}
+
+void Runtime::MirrorRefuse(const std::string &path) {
+  if (!shm_fs_cache_.IsEnabled()) {
+    return;
+  }
+  ShmFileRecord rec;
+  if (!shm_fs_cache_.TryGetFile(path, &rec)) {
+    return;  // not mirrored -> clients already use RPC for it
+  }
+  rec.flags_ |= kShmFileNoFastPath;
+  shm_fs_cache_.PutFile(path, rec);
 }
 
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
@@ -314,6 +379,10 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
     // make copied binaries executable — getattr otherwise synthesizes 0644).
     if (!existed) fi->set_mode_ = task->mode_ & 07777u;
     handles_[handle] = fi;
+    // Publish under the lock: the override fields read by MirrorFile are
+    // guarded by meta_mu_, and this is the first point at which the path's
+    // tag binding is settled.
+    MirrorFile(path, *fi);
   }
 
   task->handle_ = handle;
@@ -446,6 +515,13 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     std::lock_guard<std::mutex> g(meta_mu_);
     fi->set_atime_ = 0; fi->set_mtime_ = 0; fi->set_ctime_ = 0;
   }
+  // Re-publish the grown size. This runs AFTER every PutBlob completed, so a
+  // client that sees the new size is guaranteed the core blob mirror behind it
+  // is already updated -- the mirror can lag the file, never lead it.
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    MirrorFile(fi->path_, *fi);
+  }
   task->bytes_written_ = done;
   task->new_size_ = fi->size_.load();
   task->return_code_ = ok ? 0 : EIO;
@@ -507,6 +583,13 @@ clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
   // settled when the batch is sequenced (eventual consistency), so offset_ is
   // best-effort.
   clio::run::u64 newsz = fi->size_.fetch_add(want) + want;
+  // Refuse the client fast path until the batch is sequenced: the bytes are
+  // under the staging tag, not this file's pages, and the size above is
+  // explicitly best-effort. AppendExecution re-publishes without the flag.
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    MirrorFile(fi->path_, *fi, kShmFilePendingAppend);
+  }
   task->offset_ = newsz - want;
   task->bytes_written_ = want;
   task->new_size_ = newsz;
@@ -717,6 +800,13 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
   std::string path = task->path_.str();
   clio::run::u64 new_size = task->new_size_;
 
+  // Invalidate FIRST (issue #817). Unlike a growing write, a truncate destroys
+  // bytes a client may be mid-read on: leaving the old size published while
+  // the pages are being deleted would let a reader clamp against a size that
+  // no longer exists. Refusing costs those readers an RPC; publishing late
+  // would hand them stale data.
+  MirrorRefuse(path);
+
   // Resolve the tag + old logical size and set the new logical size. Capture
   // everything under the lock, then release it BEFORE any co_await (never hold
   // a std::mutex across a coroutine suspension).
@@ -795,6 +885,15 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
     CLIO_CO_AWAIT(tb);
   }
 
+  // Re-publish the settled state, clearing the refusal set above.
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    auto it = by_path_.find(path);
+    if (it != by_path_.end() && it->second) {
+      MirrorFile(path, *it->second);
+    }
+  }
+
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -814,6 +913,10 @@ clio::run::TaskResume Runtime::Unlink(clio::run::shared_ptr<UnlinkTask> &task) {
       CLIO_CO_RETURN;
     }
   }
+
+  // Drop the mirror BEFORE the tag goes away (issue #817), so no client can
+  // resolve this path to a tag that is being deleted underneath it.
+  MirrorErase(path);
 
   // DelTag is hierarchy-aware: a hard-link (alias) path unlinks only that name;
   // for the canonical name it promotes a surviving alias so the file lives until
@@ -918,6 +1021,18 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
     task->return_code_ = 0;
     CLIO_CO_RETURN;
   }
+
+  // Drop both operands from the SHM mirror before anything moves (issue #817).
+  //
+  // Descendants of a renamed DIRECTORY are deliberately not swept: their
+  // records still name the right tag (a rename keeps the TagId, so the pages
+  // move with it), and the client fast path is reached only through an open
+  // descriptor — where POSIX says I/O must keep working across a rename
+  // anyway. That equivalence stops holding the moment a path-keyed lookup is
+  // used for name resolution (e.g. accelerating stat(2) by path), which is why
+  // this issue's stat path still goes through the runtime.
+  MirrorErase(src);
+  MirrorErase(dst);
 
   // Resolve the source tag (its name is the path). Renaming the tag keeps its
   // TagId, so every page-blob (keyed by TagId) moves with it — no data copy.
@@ -1420,6 +1535,7 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
     if (m_now) fi->set_mtime_ = now;
     else if (m_set) fi->set_mtime_ = task->mtime_ns_;
     fi->set_ctime_ = now;  // utimens always advances ctime
+    MirrorFile(path, *fi);
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -1487,6 +1603,7 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
     // chmod rides the same task (uid/gid unchanged): store the permission bits.
     if (task->mode_ != 0xFFFFFFFFu) fi->set_mode_ = task->mode_ & 07777u;
     fi->set_ctime_ = clio::cte::core::GetCurrentTimeNs();  // chown/chmod advances ctime
+    MirrorFile(path, *fi);
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -1774,6 +1891,19 @@ clio::run::TaskResume Runtime::AppendExecution(
       auto d = cte_.AsyncDelBlob(staging, s.data_blob_id_,
                                  clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(d);
+    }
+  }
+
+  // The tail now lives in the file's own page blobs again, so the file is
+  // fast-pathable once more (issue #817): re-publish without the pending-append
+  // refusal. Scanning by_path_ is bounded by the open-file count and only runs
+  // when appends were actually drained.
+  if (ok) {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    for (auto &kv : by_path_) {
+      if (kv.second && kv.second->tag_id_ == tag_id) {
+        MirrorFile(kv.first, *kv.second);
+      }
     }
   }
 

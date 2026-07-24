@@ -90,7 +90,24 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // Update client pool_id_ with the actual pool ID from the task
   cte_client->pool_id_ = create_task->new_pool_id_;
 
-  // Delete the create task
+  // Attach the shared-memory metadata cache (issue #783, wired up in #817).
+  // Until this call existed the cache was only ever attached by its own unit
+  // tests, so `Tag::GetBlob`'s zero-IPC fast path was dead in every real
+  // process. Must run AFTER pool_id_ is set: directory lookup is keyed by pool,
+  // and a shared slot would attach whichever CTE pool cached last.
+  //
+  // The DIRECTORY overload, not the CreateTask one: the task carries a non-zero
+  // root offset only for the process that actually caused pool creation, and
+  // under `clio compose` the pool already exists by the time any real client
+  // runs. (Reading the task's params here would also drag the config parser
+  // into the client library, which does not link it.)
+  //
+  // Failure is not an error -- a TCP client, a remote node, or a runtime built
+  // without the cache all legitimately report false, and every caller of the
+  // fast path falls back to RPC.
+  if (!cte_client->AttachShmCache()) {
+    HLOG(kDebug, "CTE ClientInit: SHM metadata cache unavailable; using RPC");
+  }
 
   // Mark as successfully initialized
   is_initialized_ = true;

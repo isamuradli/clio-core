@@ -987,6 +987,32 @@ bool IpcManager::ServerInitShm() {
              metadata_segment_size, budget, clamped);
         metadata_segment_size = clamped;
       }
+
+      // OFF LINUX THE SEGMENT IS A FILE, NOT MEMORY (issue #817).
+      // SystemInfo::CreateNewSharedMemory uses memfd_create only on Linux;
+      // macOS/BSD fall back to a regular file under /tmp/clio_$USER (POSIX
+      // shm_open names cap at 31 chars and have no filesystem path, which
+      // breaks the readiness probes). Everything above -- "the reservation is
+      // nearly free because it is sparse and never pre-faulted" -- is a
+      // statement about memfd and RAM, and it is simply not true of a file:
+      // the ftruncate/mmap goes against the DISK, and a multi-GB request on a
+      // CI runner fails outright.
+      //
+      // That is why macOS has no metadata segment at all today, and therefore
+      // no SHM metadata cache (#783) and no clio-fs fast path (#817) -- both
+      // silently degrade to RPC. Ask for something a filesystem will actually
+      // give us there. Still generous: at 560 B per cached blob this holds
+      // ~1.9M entries.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMetadataCap = 1024ULL * 1024 * 1024;  // 1 GB
+      if (metadata_segment_size > kNonLinuxMetadataCap) {
+        HLOG(kInfo,
+             "Metadata segment: file-backed on this platform (no memfd); "
+             "clamping {} bytes to {} bytes",
+             metadata_segment_size, kNonLinuxMetadataCap);
+        metadata_segment_size = kNonLinuxMetadataCap;
+      }
+#endif
     }
 
     HLOG(kInfo,

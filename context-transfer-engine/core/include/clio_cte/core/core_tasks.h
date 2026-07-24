@@ -35,6 +35,7 @@
 #define WRPCTE_CORE_TASKS_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 
 #include <clio_runtime/clio_runtime.h>
@@ -849,6 +850,41 @@ struct BlobInfo {
   // RecomputeTotalSize()). Without it, a file built by millions of tiny
   // O_APPEND writes pays an O(blocks) sum on every put -> O(N^2) (generic/069).
   clio::run::u64 total_size_cache_;
+  // Monotonic counter bumped by EVERY mutation of blocks_ (issue #817). It is
+  // copied into ShmBlobRecord::placement_gen_, which a client reads before and
+  // after copying a payload out of shared memory: if it moved, the bytes may
+  // be a mix of two blobs and must be discarded.
+  //
+  // The field existed on the cache record from #783 but nothing ever
+  // incremented it, so the client's before/after comparison was 0 == 0 and
+  // could only ever catch an outright erase. Every writer that touches blocks_
+  // must call BumpPlacementGen() and re-publish the mirror -- a stale mirror
+  // with an unchanged generation is exactly the case the check cannot see.
+  clio::run::u64 placement_gen_;
+
+#if CTP_IS_HOST
+  /**
+   * Source of placement generations: a runtime-wide monotonic counter, NOT a
+   * per-blob increment.
+   *
+   * Per-blob counting is unsafe across a re-create. ReorganizeBlob moves a blob
+   * by DelBlob + PutBlob, and the replacement BlobInfo starts at zero: a blob
+   * of the same size re-extends into the same number of blocks and lands on the
+   * SAME generation value it had before the move. A client that copied from the
+   * old (now freed, possibly reallocated) blocks would then re-read an equal
+   * generation and accept the bytes. A global counter cannot collide that way.
+   */
+  static std::atomic<clio::run::u64> &PlacementGenCounter() {
+    static std::atomic<clio::run::u64> counter{1};
+    return counter;
+  }
+
+  /** Record that this blob's physical placement changed. */
+  void BumpPlacementGen() {
+    placement_gen_ =
+        PlacementGenCounter().fetch_add(1, std::memory_order_relaxed);
+  }
+#endif
 
   CTP_CROSS_FUN BlobInfo()
       : blob_name_(CLIO_PRIV_ALLOC),
@@ -862,7 +898,8 @@ struct BlobInfo {
         trace_key_(0),
         preallocated_size_(0),
         write_owner_(0),
-        total_size_cache_(0) {
+        total_size_cache_(0),
+        placement_gen_(0) {
     prealloc_lock_.Init();
   }
 
@@ -878,7 +915,8 @@ struct BlobInfo {
         trace_key_(0),
         preallocated_size_(0),
         write_owner_(0),
-        total_size_cache_(0) {
+        total_size_cache_(0),
+        placement_gen_(0) {
     prealloc_lock_.Init();
   }
 
@@ -895,7 +933,8 @@ struct BlobInfo {
         trace_key_(0),
         preallocated_size_(0),
         write_owner_(0),
-        total_size_cache_(0) {
+        total_size_cache_(0),
+        placement_gen_(0) {
     prealloc_lock_.Init();
   }
 #endif
@@ -912,7 +951,8 @@ struct BlobInfo {
         trace_key_(other.trace_key_),
         preallocated_size_(other.preallocated_size_),
         write_owner_(0),  // a fresh copy is unlocked; never inherit lock state
-        total_size_cache_(other.total_size_cache_) {
+        total_size_cache_(other.total_size_cache_),
+        placement_gen_(other.placement_gen_) {
     prealloc_lock_.Init();
   }
 
@@ -929,6 +969,7 @@ struct BlobInfo {
       trace_key_ = other.trace_key_;
       preallocated_size_ = other.preallocated_size_;
       total_size_cache_ = other.total_size_cache_;
+      placement_gen_ = other.placement_gen_;
     }
     return *this;
   }

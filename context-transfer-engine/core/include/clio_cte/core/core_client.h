@@ -41,6 +41,8 @@
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace clio::cte::core {
@@ -183,9 +185,13 @@ class Client : public clio::run::ContainerClient {
       return false;
     }
     if (!rec.IsDirectReadable()) {
-      return false;  // file/remote/GPU-tier blob, or truncated block list
+      return false;  // file/remote/GPU-tier blob
     }
-    if (offset + size > rec.total_size_) {
+    // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
+    // record describes only its first kMaxInlineBlocks blocks, and a read past
+    // them has no block to resolve against. For an untruncated record the two
+    // are equal, so this is strictly the safer of the two bounds.
+    if (offset + size > rec.CoveredBytes()) {
       return false;
     }
     const clio::run::u64 gen_before = rec.placement_gen_;
@@ -1141,6 +1147,26 @@ class Client : public clio::run::ContainerClient {
   // Keyed by target pool. Attaching is not free, and the fast path is meant to
   // be a few hundred nanoseconds, so a miss here would dominate the cost.
   std::unordered_map<clio::run::u64, RamBdevMap> ram_bdevs_;
+  /**
+   * Guards ram_bdevs_ (issue #817).
+   *
+   * The process-wide CTE client is shared by every thread of an application,
+   * and the POSIX/STDIO interceptors hand it arbitrary multi-threaded callers,
+   * so two threads racing a first read of different targets would otherwise
+   * rehash the map concurrently -- a use-after-free, i.e. a segfault, on the
+   * hot path. Shared for the steady state (every read after the first),
+   * exclusive only to attach.
+   *
+   * A free function rather than a member because Client must stay
+   * move-assignable (`cte_ = Client(pool_id)` in the filesystem chimod, and the
+   * generated lib_exec), which a std::shared_mutex member would delete. One
+   * lock covering every instance costs nothing: it is contended only on the
+   * first read of a target in a process.
+   */
+  static std::shared_mutex &RamBdevMutex() {
+    static std::shared_mutex mu;
+    return mu;
+  }
 
   /**
    * Resolve (attaching on first use) the base address of a RAM bdev's shared
@@ -1153,9 +1179,20 @@ class Client : public clio::run::ContainerClient {
    */
   char *MapRamBdev(const clio::run::PoolId &pool_id) {
     clio::run::u64 key = pool_id.ToU64();
-    auto it = ram_bdevs_.find(key);
-    if (it != ram_bdevs_.end()) {
-      return it->second.base;
+    {
+      // Steady state: the segment is already attached, so this is a shared
+      // lock and a hash lookup.
+      std::shared_lock<std::shared_mutex> rd(RamBdevMutex());
+      auto it = ram_bdevs_.find(key);
+      if (it != ram_bdevs_.end()) {
+        return it->second.base;
+      }
+    }
+    std::unique_lock<std::shared_mutex> wr(RamBdevMutex());
+    // Re-check: another thread may have attached between the two locks.
+    auto found = ram_bdevs_.find(key);
+    if (found != ram_bdevs_.end()) {
+      return found->second.base;
     }
     auto *ipc = CLIO_CPU_IPC;
     RamBdevMap &slot = ram_bdevs_[key];  // caches the negative result too

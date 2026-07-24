@@ -296,6 +296,61 @@ void Runtime::FixupAfterCopy(clio::run::u32 method,
   }
 }
 
+namespace {
+
+/**
+ * Does this target's storage live on THIS node? (issue #817)
+ *
+ * Resolves the target's routing query to a node, rather than asking whether
+ * the query was literally written as `Local`. That distinction is the whole
+ * bug: `Runtime::Create` registers every composed target as
+ * `PoolQuery::DirectHash(target_node)` (the sliding neighborhood window), so
+ * `IsLocalMode()` is false for every target in a real deployment. The payload
+ * fast path was therefore only ever enabled for a target a test had
+ * hand-registered with `PoolQuery::Local()` -- it could never turn on in
+ * production, on any node, for any blob.
+ *
+ * Mirrors ResolveDirectHashQuery's own resolution (hash % num_containers, then
+ * ask the pool manager where that container lives), so "the fast path thinks
+ * it is local" and "the router would keep the task local" cannot disagree.
+ *
+ * Unknown or multi-destination modes return false: the default must be refuse.
+ */
+bool TargetIsNodeLocal(const clio::run::PoolQuery &q,
+                       const clio::run::PoolId &bdev_pool) {
+  if (q.IsLocalMode()) {
+    return true;
+  }
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  auto *ipc = CLIO_IPC;
+  if (pool_manager == nullptr || ipc == nullptr) {
+    return false;
+  }
+  clio::run::ContainerId container_id = 0;
+  if (q.IsDirectIdMode()) {
+    container_id = q.GetContainerId();
+  } else if (q.IsDirectHashMode()) {
+    const clio::run::PoolInfo *pi = pool_manager->GetPoolInfo(bdev_pool);
+    if (pi == nullptr || pi->num_containers_ == 0) {
+      return false;
+    }
+    container_id = q.GetHash() % pi->num_containers_;
+  } else if (q.IsPhysicalMode()) {
+    return q.GetNodeId() == ipc->GetNodeId();
+  } else {
+    // Broadcast/Range/Dynamic name zero or many destinations; a payload read
+    // needs exactly one, and it must be here.
+    return false;
+  }
+  if (pool_manager->HasContainer(bdev_pool, container_id)) {
+    return true;
+  }
+  return pool_manager->GetContainerNodeId(bdev_pool, container_id) ==
+         ipc->GetNodeId();
+}
+
+}  // namespace
+
 // ===========================================================================
 // issue #783: projection of the authoritative BlobInfo into its shared-memory
 // cache record. Deliberately lossy -- the cache stores only what a client
@@ -310,21 +365,29 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   out->last_modified_ = info.last_modified_;
   out->last_read_ = info.last_read_;
   out->score_ = info.score_;
+  // Carries the block-layout generation to the client, which compares it
+  // before and after copying a payload (issue #817).
+  out->placement_gen_ = info.placement_gen_;
 
   size_t n = info.blocks_.size();
   if (n > kMaxInlineBlocks) {
-    // Too many blocks to represent. Cache the metadata but mark it truncated
-    // so no client ever tries a payload read from a partial block list.
+    // More blocks than fit. Cache the first kMaxInlineBlocks -- they are the
+    // blob's leading blocks in logical order, so they describe a known PREFIX
+    // exactly (issue #817). The truncated flag tells a client to bound its
+    // read by CoveredBytes() instead of total_size_; it no longer means
+    // "unreadable", which used to refuse every blob over 512 KB (= 8 x the
+    // 64 KB kMaxBlockChunk) and so refused every 1 MiB clio-fs page.
     out->flags_ |= kShmBlobTruncated;
     n = kMaxInlineBlocks;
   }
   out->num_blocks_ = static_cast<clio::run::u32>(n);
 
-  // A payload may only be read directly out of shared memory when EVERY block
-  // is node-local and RAM-backed. This starts true and is cleared by the first
-  // block that fails to qualify -- the default must be "refuse", so an
-  // unknown target can never be mistaken for a readable one.
-  bool all_direct = (n > 0) && ((out->flags_ & kShmBlobTruncated) == 0);
+  // A payload may only be read directly out of shared memory when every
+  // CACHED block is node-local and RAM-backed. This starts true and is cleared
+  // by the first block that fails to qualify -- the default must be "refuse",
+  // so an unknown target can never be mistaken for a readable one. Blocks past
+  // the cached prefix are not inspected and are never read from.
+  bool all_direct = (n > 0);
 
   for (size_t i = 0; i < n; ++i) {
     const BlobBlock &b = info.blocks_[i];
@@ -345,7 +408,9 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
     }
     d.bdev_type_ = static_cast<clio::run::u32>(tinfo->bdev_type_);
     const bool is_ram = (tinfo->bdev_type_ == clio::run::bdev::BdevType::kRam);
-    const bool is_local = tinfo->target_query_.IsLocalMode();
+    const bool is_local =
+        TargetIsNodeLocal(tinfo->target_query_, d.target_pool_);
+    d.node_id_ = is_local ? CLIO_IPC->GetNodeId() : 0xFFFFFFFFu;
     if (!is_ram || !is_local) {
       // kPinned/kHbm are excluded deliberately: their pages come from GPU
       // allocators and are not SHM-backed, so their offsets are meaningless
@@ -2425,6 +2490,17 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     }
     clio::run::u64 final_size = blob_info_ptr->GetTotalSize();
 
+    // issue #817: republish the resized block list. ResizeBlob returned the
+    // dropped blocks to the bdev free pool, so a mirror still describing them
+    // points a client at storage that can be handed to another blob. The
+    // before/after placement_gen_ check cannot save it either -- a mirror that
+    // is never updated shows the reader the SAME stale generation twice.
+    {
+      std::string shm_key = std::to_string(tag_id.major_) + "." +
+                            std::to_string(tag_id.minor_) + "." + blob_name;
+      MirrorBlobToShm(shm_key, *blob_info_ptr);
+    }
+
     // Update the tag's total_size_ by the delta.
     {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
@@ -3692,6 +3768,10 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
     // Update blob blocks to only keep nonvolatile blocks
     blob_info_ptr->blocks_ = nonvolatile_blocks;
     blob_info_ptr->RecomputeTotalSize();  // blocks_ replaced: resync size cache
+    blob_info_ptr->BumpPlacementGen();    // #817: blocks moved under readers
+    // Republish immediately: the volatile blocks were just freed, so a mirror
+    // still naming them points clients at reusable storage.
+    MirrorBlobToShm(entry.composite_key, *blob_info_ptr);
 
     // Step 3: Re-put data using AsyncPutBlob with persistence context
     Context flush_ctx;
@@ -4505,6 +4585,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       // push_back (the debit lock + next AllocateFromTarget below both co_await),
       // so a concurrent reader never sees grown blocks_ with a stale cache.
       blob_info.total_size_cache_ += logical;
+      blob_info.BumpPlacementGen();  // #817: block layout changed
 
       // Debit the CANONICAL target's remaining_space_ by the PHYSICAL bytes
       // taken (mirror of FreeAllBlobBlocks' capacity_ credit); AllocateFromTarget
@@ -4611,6 +4692,9 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   for (auto &b : keep) {
     blob_info.blocks_.push_back(b);
   }
+  // #817: the dropped blocks go back to the bdev free pool and can be handed
+  // to another blob, so a client copying from them must be told to discard.
+  blob_info.BumpPlacementGen();
   // The kept blocks span exactly [0, new_size) (the boundary block was trimmed),
   // so the O(1) size cache is precisely new_size.
   blob_info.total_size_cache_ = new_size;
@@ -5120,6 +5204,7 @@ clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
   // Clear all blocks
   blob_info.blocks_.clear();
   blob_info.total_size_cache_ = 0;  // blocks_ emptied: size cache is now 0
+  blob_info.BumpPlacementGen();     // #817: every block just became reusable
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

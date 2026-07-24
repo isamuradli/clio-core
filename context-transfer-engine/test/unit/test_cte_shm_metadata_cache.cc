@@ -172,13 +172,42 @@ TEST_CASE("ShmCache: insert and read back in-process", "[shm_cache]") {
   f.Destroy();
 }
 
-TEST_CASE("ShmCache: truncated blob is not direct-readable", "[shm_cache]") {
+TEST_CASE("ShmCache: truncated blob is readable only over its prefix",
+          "[shm_cache]") {
+  // Contract changed in issue #817. A truncated record carries the blob's
+  // FIRST blocks in logical order, so it describes a known prefix exactly;
+  // refusing the whole blob discarded complete information (and, since the
+  // CTE caps blocks at 64 KB, refused every blob over kMaxInlineBlocks*64 KB
+  // -- which is every 1 MiB clio-fs page). It is readable, but only up to
+  // CoveredBytes().
   ShmBlobRecord rec;
   rec.num_blocks_ = kMaxInlineBlocks;
   rec.flags_ = kShmBlobDirectReadable | kShmBlobTruncated;
-  // A blob with more blocks than fit must never be payload-read from the
-  // cache -- the block list it carries is incomplete.
-  REQUIRE_FALSE(rec.IsDirectReadable());
+  rec.total_size_ = 4ULL * 1024 * 1024;  // far larger than the cached prefix
+  for (clio::run::u32 i = 0; i < kMaxInlineBlocks; ++i) {
+    rec.blocks_[i].size_ = 65536;  // kMaxBlockChunk
+  }
+
+  REQUIRE(rec.IsDirectReadable());
+  // The prefix is what the blocks cover, NOT what the blob contains.
+  REQUIRE(rec.CoveredBytes() ==
+          static_cast<clio::run::u64>(kMaxInlineBlocks) * 65536);
+  REQUIRE(rec.CoveredBytes() < rec.total_size_);
+
+  // An untruncated record covers the whole blob, so the two bounds agree.
+  ShmBlobRecord whole;
+  whole.num_blocks_ = 2;
+  whole.flags_ = kShmBlobDirectReadable;
+  whole.blocks_[0].size_ = 4096;
+  whole.blocks_[1].size_ = 4096;
+  whole.total_size_ = 8192;
+  REQUIRE(whole.IsDirectReadable());
+  REQUIRE(whole.CoveredBytes() == whole.total_size_);
+
+  // No blocks at all is still a refusal -- there is nothing to read from.
+  ShmBlobRecord empty;
+  empty.flags_ = kShmBlobDirectReadable;
+  REQUIRE_FALSE(empty.IsDirectReadable());
 }
 
 TEST_CASE("ShmCache: tag maps round-trip", "[shm_cache]") {
