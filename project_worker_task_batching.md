@@ -486,3 +486,37 @@ order fixes the overlap-ordering gap #680 leaves open (#817 write notes).
 - No regression on the full fsx/xfstests adapter suite (this touches the write
   path indirectly via coalescing).
 - Unbatched single-op latency unchanged (the empty-backlog path adds nothing).
+
+## 10. fio through clio-fs: the win does NOT reach the POSIX path
+
+Measured on a throwaway branch merging this work with #817 (async writes, needed
+so `write(2)` returns once staged and a burst of same-blob writes can form). fio
+via the POSIX interceptor, 4 KiB, RAM target, async writes on, batching A/B via
+`CLIO_CTE_BATCHING`.
+
+**Concentrated** — 16 jobs on one 1 MiB file (= one page-blob), 8 paired runs:
+
+| | median IOPS | range | median p99.9 |
+|---|---|---|---|
+| batching off | 12,219 | 8.7K–16.2K | 97 ms |
+| batching on | 14,086 | 10.6K–16.3K | 79 ms |
+
+**1.15x median, faster in only 4/8 — within noise.** Sequential (8 jobs × 64 MiB)
+is parity. Contrast the direct-CTE microbenchmark, where the same knob is a clean
+3.68x.
+
+**Why it does not translate.** The clio-fs write path is `POSIX interceptor →
+cfs_io → the adapter's own async write-window/staging (#817) → filesystem chimod
+→ per-page loop → PutBlob`. Those layers reshape the traffic before it reaches
+the PutBlob layer: the adapter stages writes and the chimod mediates them, so the
+concentrated same-blob burst the direct client produced no longer **co-arrives**
+at one worker's drain window. Worker-level batching can only merge what converges
+there, and after the adapter/chimod have serialized the page, little does.
+
+**Conclusion / next step.** The 3.68x is real for a client that issues concurrent
+same-blob PutBlobs; it is not reachable by having the *runtime worker*
+re-discover a burst the fs stack already dissolved. To move the fio numbers, the
+coalescing must happen where the same-blob traffic actually converges — most
+directly by having the **cfs adapter or filesystem chimod emit a vectored PutBlob
+(part A's API) per page** instead of N single-region ones. Part A is exactly the
+primitive that path needs; part B is the wrong layer for the POSIX workload.

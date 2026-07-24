@@ -39,6 +39,12 @@ class WorkerBlockMap {
   WorkerBlockMap();
 
   bool AllocateBlock(int block_type, Block& block, size_t min_size = 0);
+  /** Pull ANY freed block whose size_ is <= max_bytes (largest first), for
+   *  fragmentation reuse (issue #820). Unlike AllocateBlock, which finds a
+   *  block >= a size in one category, this scans every bucket for a block that
+   *  FITS what is left -- a freed 8 KiB block bucketed under 16 KiB is exactly
+   *  the case the >= match could never reach. */
+  bool AllocateAnyUpTo(size_t max_bytes, Block& block);
   void FreeBlock(Block block);
 
  private:
@@ -54,6 +60,9 @@ class GlobalBlockMap {
 
   void Init(size_t num_workers);
   bool AllocateBlock(int worker, size_t io_size, Block& block);
+  /** @copydoc WorkerBlockMap::AllocateAnyUpTo -- searches this worker's map
+   *  first, then steals from the others. */
+  bool AllocateAnyUpTo(int worker, size_t max_bytes, Block& block);
   bool FreeBlock(int worker, Block& block);
 
   /** Map an I/O size to its block-size category, or -1 if larger than all. */

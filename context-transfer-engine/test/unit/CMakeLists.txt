@@ -110,6 +110,13 @@ add_executable(test_vectored_blob_io
     test_vectored_blob_io.cc
 )
 
+# bdev fragmentation reuse (#820): large alloc served from fragmented small
+# free extents -- the decisive regression test for moving anti-fragmentation
+# from the CTE into the bdev allocator.
+add_executable(test_bdev_fragmentation
+    test_bdev_fragmentation.cc
+)
+
 # Batching benchmark (#820): many small writes at ONE blob, A/B'd on the same
 # binary via CLIO_TASK_BATCHING.
 add_executable(bench_same_blob_batching
@@ -390,6 +397,18 @@ target_link_libraries(test_concurrent_same_blob
 
 # Link test_vectored_blob_io (#820 vectored blob I/O) - same deps.
 target_link_libraries(test_vectored_blob_io
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_bdev_fragmentation (#820) - same deps.
+target_link_libraries(test_bdev_fragmentation
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -743,6 +762,43 @@ set_tests_properties(
         LABELS "regression;concurrent;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100"
 )
+
+# issue #820: run the SAME rigorous same-blob correctness test again, this time
+# THROUGH the batching merge path (CLIO_CTE_BATCHING + CLIO_BATCH_LANE). Without
+# these env vars BuildBatch returns at its policy gate and SmashBatch /
+# CompleteBatchParents / the inline-exec sink never run -- which is why coverage
+# of the merge path was ~0. Reusing this test means the merged path is checked
+# by the strongest correctness assertion there is (each thread's disjoint region
+# must survive intact), not a bespoke smoke test.
+add_test(NAME cte_concurrent_same_blob_batched
+    COMMAND test_concurrent_same_blob)
+set_tests_properties(
+    cte_concurrent_same_blob_batched
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "regression;concurrent;cte;batching"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;CLIO_CTE_BATCHING=1;CLIO_BATCH_LANE=1"
+)
+
+# issue #820: vectored PutBlob/GetBlob correctness (equivalence with N single
+# puts, list-order overlap, union-range allocation, get-scatter, malformed-
+# segment rejection).
+add_test(NAME cte_vectored_blob_io
+    COMMAND test_vectored_blob_io)
+set_tests_properties(cte_vectored_blob_io PROPERTIES
+    TIMEOUT 300
+    LABELS "unit;cte;vectored;820"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
+# issue #820: bdev fragmentation reuse -- large alloc served from fragmented
+# small free extents. Decisive regression test for moving anti-fragmentation
+# from the CTE into the bdev allocator (the 074/521/522 scenario).
+add_test(NAME cte_bdev_fragmentation
+    COMMAND test_bdev_fragmentation)
+set_tests_properties(cte_bdev_fragmentation PROPERTIES
+    TIMEOUT 300
+    LABELS "regression;bdev;cte;820"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
 
 # Add reorganize blob tests
 # NOTE: These tests are chained (Put -> Move -> Integrity -> Promote -> Cleanup)

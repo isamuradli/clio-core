@@ -247,6 +247,71 @@ TEST_CASE("Vectored PutBlob == N single puts, and segments apply in list order",
   }
 }
 
+// The per-segment validation branches in PutBlobImpl/GetBlobImpl: a vectored
+// task with a zero-size or null-buffer segment must be REFUSED, not silently
+// half-applied. These are cheap, deterministic, and were the runtime's untested
+// error paths.
+TEST_CASE("Vectored I/O rejects malformed segments", "[cte][vectored][820]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *ipc = CLIO_IPC;
+  auto *cte = CLIO_CTE_CLIENT;
+  clio::cte::core::Tag tag("vec_bad_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+  const size_t kSeg = 4096;
+  auto good = FillBuf(kSeg, 'g');
+
+  // PutBlob: a zero-size segment.
+  {
+    std::vector<clio::cte::core::BlobSegment> segs;
+    segs.push_back(clio::cte::core::BlobSegment(0, kSeg,
+                                                ctp::ipc::ShmPtr<>(good.shm_)));
+    segs.push_back(clio::cte::core::BlobSegment(kSeg, 0,
+                                                ctp::ipc::ShmPtr<>(good.shm_)));
+    auto p = cte->AsyncPutBlobVectored(tag_id, "put_zero", segs);
+    p.Wait();
+    REQUIRE(p->GetReturnCode() != 0);
+  }
+  // PutBlob: a null-buffer segment.
+  {
+    std::vector<clio::cte::core::BlobSegment> segs;
+    segs.push_back(clio::cte::core::BlobSegment(0, kSeg,
+                                                ctp::ipc::ShmPtr<>(good.shm_)));
+    segs.push_back(clio::cte::core::BlobSegment(kSeg, kSeg,
+                                                ctp::ipc::ShmPtr<>::GetNull()));
+    auto p = cte->AsyncPutBlobVectored(tag_id, "put_null", segs);
+    p.Wait();
+    REQUIRE(p->GetReturnCode() != 0);
+  }
+  // GetBlob: zero-size and null-buffer segments (need a blob to read).
+  {
+    auto p = cte->AsyncPutBlob(tag_id, "get_bad", 0, 2 * kSeg,
+                               ctp::ipc::ShmPtr<>(good.shm_));
+    // good only holds kSeg; that's fine, we only care the blob exists.
+    p.Wait();
+    auto dst = FillBuf(kSeg, 0);
+    {
+      std::vector<clio::cte::core::BlobSegment> segs;
+      segs.push_back(clio::cte::core::BlobSegment(0, 0,
+                                                  ctp::ipc::ShmPtr<>(dst.shm_)));
+      auto g = cte->AsyncGetBlobVectored(tag_id, "get_bad", segs);
+      g.Wait();
+      REQUIRE(g->GetReturnCode() != 0);
+    }
+    {
+      std::vector<clio::cte::core::BlobSegment> segs;
+      segs.push_back(clio::cte::core::BlobSegment(0, kSeg,
+                                                  ctp::ipc::ShmPtr<>::GetNull()));
+      auto g = cte->AsyncGetBlobVectored(tag_id, "get_bad", segs);
+      g.Wait();
+      REQUIRE(g->GetReturnCode() != 0);
+    }
+    ipc->FreeBuffer(dst);
+  }
+  ipc->FreeBuffer(good);
+  std::printf("[#820] vectored I/O rejects zero-size and null segments\n");
+}
+
 int main(int argc, char **argv) {
   g_fixture = new Fixture();
   std::string filter = (argc > 1) ? argv[1] : "";

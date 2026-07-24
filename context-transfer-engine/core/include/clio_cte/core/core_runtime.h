@@ -584,8 +584,9 @@ private:
    * @param success Output parameter: true if allocation succeeded, false otherwise
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume AllocateFromTarget(TargetInfo &target_info, clio::run::u64 size,
-                                     clio::run::u64 &allocated_offset, bool &success);
+  clio::run::TaskResume AllocateFromTarget(
+      TargetInfo &target_info, clio::run::u64 size,
+      std::vector<clio::run::bdev::Block> &out_blocks, bool &success);
 
   /**
    * Free all blocks from a blob back to their respective targets

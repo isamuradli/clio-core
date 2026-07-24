@@ -4539,71 +4539,64 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       continue;
     }
 
-    // Back a large logical extension with MULTIPLE small physical blocks by
-    // capping each block at kMaxBlockChunk. Under long-soak churn the bdev free
-    // pool fragments into sub-request-size extents (measured: ~4640 extents,
-    // largest ~324 KB) while a single-block extension request is 0.5-1 MB, so
-    // one large contiguous block can NEVER be reused and the bump-only Heap
-    // watermark climbs to the tier capacity → write EIO (074/521/522). Small
-    // blocks match the fragmented pool and reuse freed space. The blob stores
-    // blocks_ as a vector and read/write iterate them, so multi-block extents
-    // are transparent to the data path. AllocateFromTarget decrements the copy's
-    // remaining_space_ by reference, so the loop condition drains naturally.
-    constexpr clio::run::u64 kMaxBlockChunk = 65536;  // 64 KB
-    constexpr clio::run::u64 kAppendSlab = 4096;      // bdev slab granularity
-    while (remaining_to_allocate > 0 && target_info_copy.remaining_space_ > 0) {
-      // Logical bytes this block carries.
-      clio::run::u64 logical =
-          std::min(std::min(remaining_to_allocate,
-                            target_info_copy.remaining_space_),
-                   kMaxBlockChunk);
-      // Physical bytes to request: round the logical UP to a whole slab so a
-      // small append leaves reusable spare capacity for the next append (the
-      // spare-fill path above). The request stays <=64 KB-ish, so the
-      // small-block anti-fragmentation property 074/521/522 rely on holds. If
-      // rounding up would exceed the target's free space, take exactly logical.
-      clio::run::u64 physical =
-          ((logical + kAppendSlab - 1) / kAppendSlab) * kAppendSlab;
-      if (physical > target_info_copy.remaining_space_) {
-        physical = logical;
-      }
+    // Ask the bdev for the whole extent this target can cover, in ONE request.
+    // Fragmentation across reused free blocks is the allocator's job now
+    // (issue #820): it returns however many physical blocks it took, and the
+    // blob's blocks_ vector carries those multi-block extents transparently to
+    // read/write. This is what used to be worked around here by capping every
+    // block at 64 KB so the bdev could always answer with one contiguous block
+    // -- an anti-fragmentation policy that did not belong in the CTE.
+    constexpr clio::run::u64 kAppendSlab = 4096;  // bdev slab granularity
+    clio::run::u64 req =
+        std::min(remaining_to_allocate, target_info_copy.remaining_space_);
+    if (req == 0) {
+      continue;
+    }
+    std::vector<clio::run::bdev::Block> out_blocks;
+    bool alloc_success = false;
+    CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, req, out_blocks,
+                                alloc_success));
+    if (!alloc_success || out_blocks.empty()) {
+      continue;  // this target can't satisfy req; outer loop tries the next
+    }
 
-      clio::run::u64 allocated_offset;
-      bool alloc_success = false;
-      CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, physical,
-                                  allocated_offset, alloc_success));
-      if (!alloc_success) {
-        break;  // this target can't satisfy more; outer loop tries the next
-      }
-
-      // size_ = logical used, capacity_ = physical slab (>= logical).
+    // Distribute the logical request `req` across the physical blocks the bdev
+    // returned. Each block's size_ is its PHYSICAL footprint (what it occupies
+    // and what capacity_ must credit on free); the blob covers up to that many
+    // logical bytes with it, so `req` logical bytes span the blocks with only
+    // the last one carrying spare capacity. No co_await in this loop, so
+    // total_size_cache_ advances atomically with blocks_ wrt other tasks on
+    // this worker.
+    clio::run::u64 physical_sum = 0;
+    clio::run::u64 need = req;
+    for (const auto &b : out_blocks) {
+      const clio::run::u64 physical = b.size_;  // footprint
+      const clio::run::u64 logical = std::min(physical, need);
       BlobBlock new_block(target_info_copy.bdev_client_,
-                          target_info_copy.target_query_, allocated_offset,
-                          logical, physical);
+                          target_info_copy.target_query_, b.offset_, logical,
+                          physical);
       blob_info.blocks_.push_back(new_block);
-      // Advance the O(1) size cache in the SAME co_await-free step as the
-      // push_back (the debit lock + next AllocateFromTarget below both co_await),
-      // so a concurrent reader never sees grown blocks_ with a stale cache.
       blob_info.total_size_cache_ += logical;
-      blob_info.BumpPlacementGen();  // #817: block layout changed
+      physical_sum += physical;
+      need -= logical;
+    }
+    blob_info.BumpPlacementGen();  // #817: block layout changed
+    remaining_to_allocate -= req;  // sum of logical == req
+    (void)kAppendSlab;
 
-      // Debit the CANONICAL target's remaining_space_ by the PHYSICAL bytes
-      // taken (mirror of FreeAllBlobBlocks' capacity_ credit); AllocateFromTarget
-      // only touched the copy.
-      {
-        clio::run::ScopedCoRwReadLock read_lock(target_lock_);
-        TargetInfo *ti = registered_targets_.find(selected_target_id);
-        if (ti != nullptr) {
-          ctp::ipc::atomic_ref<clio::run::u64> rs(ti->remaining_space_);
-          clio::run::u64 cur = rs.load(std::memory_order_relaxed);
-          while (!rs.compare_exchange_weak(
-              cur, (cur > physical) ? cur - physical : 0,
-              std::memory_order_relaxed)) {
-          }
+    // Debit the CANONICAL target's remaining_space_ by the physical bytes taken
+    // (mirror of FreeAllBlobBlocks' capacity_ credit).
+    {
+      clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+      TargetInfo *ti = registered_targets_.find(selected_target_id);
+      if (ti != nullptr) {
+        ctp::ipc::atomic_ref<clio::run::u64> rs(ti->remaining_space_);
+        clio::run::u64 cur = rs.load(std::memory_order_relaxed);
+        while (!rs.compare_exchange_weak(
+            cur, (cur > physical_sum) ? cur - physical_sum : 0,
+            std::memory_order_relaxed)) {
         }
       }
-
-      remaining_to_allocate -= logical;
     }
   }
 
@@ -5020,10 +5013,9 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
 
 // Block management helper functions
 
-clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
-                                            clio::run::u64 size,
-                                            clio::run::u64 &allocated_offset,
-                                            bool &success) {
+clio::run::TaskResume Runtime::AllocateFromTarget(
+    TargetInfo &target_info, clio::run::u64 size,
+    std::vector<clio::run::bdev::Block> &out_blocks, bool &success) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -5074,29 +5066,22 @@ clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
          "alloc_task->blocks_.size()={}, return_code={}",
          alloc_task->blocks_.size(), alloc_task->return_code_.load());
 
-    std::vector<clio::run::bdev::Block> allocated_blocks;
-    for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
-      allocated_blocks.push_back(alloc_task->blocks_[i]);
-    }
-
-    // Check if we got any blocks
-    if (allocated_blocks.empty()) {
-      HLOG(kDebug, "AllocateFromTarget: FAILED - allocated_blocks is empty");
+    // Return EVERY block the bdev handed back, not just the first. The
+    // allocator may fragment one logical request across several reused physical
+    // blocks (issue #820) -- taking only blocks_[0] silently dropped the rest,
+    // which is why ExtendBlob had to cap requests at 64 KB so the bdev could
+    // always answer with a single block.
+    out_blocks.clear();
+    if (alloc_task->blocks_.empty()) {
+      HLOG(kDebug, "AllocateFromTarget: FAILED - no blocks");
       success = false;
       CLIO_CO_RETURN;
     }
-
-    // Use the first block (for single allocation case)
-    clio::run::bdev::Block allocated_block = allocated_blocks[0];
-    allocated_offset = allocated_block.offset_;
-
-    // Update remaining space
-    target_info.remaining_space_ -= size;
-    // HLOG(kInfo,
-    //       "Allocated from target {}: offset={}, size={} remaining_space={}",
-    //       target_info.target_name_, allocated_offset, size,
-    //       target_info.remaining_space_);
-
+    for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
+      out_blocks.push_back(alloc_task->blocks_[i]);
+    }
+    // Canonical remaining_space_ accounting is the caller's (ExtendBlob debits
+    // it by the physical bytes taken); this only fills out_blocks.
     success = true;
     CLIO_CO_RETURN;
   } catch (const std::exception &e) {
