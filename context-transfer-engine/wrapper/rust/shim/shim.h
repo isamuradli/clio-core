@@ -10,13 +10,16 @@
 
 namespace cte_ffi {
 
-// CteTag wraps clio::cte::core::Tag. Mutable inner allows cxx to pass
-// const CteTag& while Tag methods remain non-const.
+// CteTag is the Rust-facing tag handle: just the TagId. The blob operations
+// below are free functions that call the CTE client directly, so the handle
+// carries no state beyond the identity and the cxx `const CteTag&` signatures
+// need no mutable member.
 struct CteTag {
-  mutable clio::cte::core::Tag inner;
+  clio::cte::core::TagId id;
 
-  explicit CteTag(const std::string &name) : inner(name) {}
-  explicit CteTag(const clio::cte::core::TagId &id) : inner(id) {}
+  // Get-or-create by name; throws if the runtime rejects the request.
+  explicit CteTag(const std::string &name);
+  explicit CteTag(const clio::cte::core::TagId &tag_id) : id(tag_id) {}
 };
 
 // Forward-declared: defined by cxx-generated code (shared struct)
