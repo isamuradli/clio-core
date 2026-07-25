@@ -987,14 +987,6 @@ class Tag {
   const TagId &GetTagId() const { return tag_id_; }
 };
 
-// Flush + reset the global Tag::PutBlob(const char*) timing accumulator
-// and print a per-call breakdown of alloc / memcpy / RPC / free.
-// Intended to be called by the POSIX (and other) adapters at the end of
-// a `Filesystem::Write` so a single line summarises one user-visible
-// write operation. Pass a short label that identifies the caller
-// (e.g. "Write off=0 size=4G").
-void FlushPutBlobTiming(const char *label);
-
 }  // namespace clio::cte::core
 
 // Global singleton macro for CTE client access (returns pointer, not reference)

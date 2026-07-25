@@ -33,51 +33,10 @@
 
 #include <clio_cte/core/core_client.h>
 #include <clio_ctp/util/logging.h>
-#include <atomic>
-#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
 namespace clio::cte::core {
-
-// AggregateOut timing for Tag::PutBlob(const char*) — broken down into the
-// four steps that path performs per call (alloc shm, memcpy, sync RPC,
-// free). Counters are flushed by FlushPutBlobTiming(); the POSIX adapter
-// calls that at the end of each Filesystem::Write so we get one summary
-// line per file-write operation.
-namespace {
-std::atomic<uint64_t> g_pb_calls{0};
-std::atomic<uint64_t> g_pb_bytes{0};
-std::atomic<uint64_t> g_pb_alloc_ns{0};
-std::atomic<uint64_t> g_pb_memcpy_ns{0};
-std::atomic<uint64_t> g_pb_rpc_ns{0};
-std::atomic<uint64_t> g_pb_free_ns{0};
-}  // namespace
-
-void FlushPutBlobTiming(const char *label) {
-  uint64_t n = g_pb_calls.exchange(0);
-  if (n == 0) return;
-  uint64_t bytes = g_pb_bytes.exchange(0);
-  uint64_t alloc_ns = g_pb_alloc_ns.exchange(0);
-  uint64_t memcpy_ns = g_pb_memcpy_ns.exchange(0);
-  uint64_t rpc_ns = g_pb_rpc_ns.exchange(0);
-  uint64_t free_ns = g_pb_free_ns.exchange(0);
-  uint64_t total_ns = alloc_ns + memcpy_ns + rpc_ns + free_ns;
-  double total_ms = total_ns / 1e6;
-  double bw_mbs = (total_ns > 0) ? (bytes * 1e3 / total_ns) : 0.0;
-  HLOG(kInfo,
-       "[PutBlob breakdown {}] calls={} bytes={} total={:.2f}ms ({:.1f} MB/s) "
-       "alloc={:.2f}ms ({:.1f}%) memcpy={:.2f}ms ({:.1f}%) "
-       "rpc={:.2f}ms ({:.1f}%) free={:.2f}ms ({:.1f}%) | "
-       "per-call alloc={:.1f}us memcpy={:.1f}us rpc={:.1f}us free={:.1f}us",
-       label, n, bytes, total_ms, bw_mbs,
-       alloc_ns / 1e6, 100.0 * alloc_ns / total_ns,
-       memcpy_ns / 1e6, 100.0 * memcpy_ns / total_ns,
-       rpc_ns / 1e6, 100.0 * rpc_ns / total_ns,
-       free_ns / 1e6, 100.0 * free_ns / total_ns,
-       alloc_ns / 1e3 / n, memcpy_ns / 1e3 / n,
-       rpc_ns / 1e3 / n, free_ns / 1e3 / n);
-}
 
 Tag::Tag(const std::string &tag_name) : tag_name_(tag_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
@@ -95,9 +54,6 @@ Tag::Tag(const TagId &tag_id) : tag_id_(tag_id), tag_name_("") {}
 
 void Tag::PutBlob(const std::string &blob_name, const char *data, size_t data_size,
                   size_t off, float score, const Context &context) {
-  using clk = std::chrono::steady_clock;
-  auto t0 = clk::now();
-
   // Allocate shared memory for the data
   auto *ipc_manager = CLIO_IPC;
   ctp::ipc::FullPtr<char> shm_fullptr = ipc_manager->AllocateBuffer(data_size);
@@ -106,12 +62,8 @@ void Tag::PutBlob(const std::string &blob_name, const char *data, size_t data_si
     throw std::runtime_error("Failed to allocate shared memory for PutBlob");
   }
 
-  auto t1 = clk::now();
-
   // Copy data to shared memory
   memcpy(shm_fullptr.ptr_, data, data_size);
-
-  auto t2 = clk::now();
 
   // Convert to ctp::ipc::ShmPtr<> for API call
   ctp::ipc::ShmPtr<> shm_ptr(shm_fullptr.shm_);
@@ -119,23 +71,8 @@ void Tag::PutBlob(const std::string &blob_name, const char *data, size_t data_si
   // Call SHM version with provided score and context
   PutBlob(blob_name, shm_ptr, data_size, off, score, context);
 
-  auto t3 = clk::now();
-
   // Explicitly free shared memory buffer
   ipc_manager->FreeBuffer(shm_fullptr);
-
-  auto t4 = clk::now();
-
-  auto ns = [](clk::time_point a, clk::time_point b) {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
-  };
-  g_pb_calls.fetch_add(1, std::memory_order_relaxed);
-  g_pb_bytes.fetch_add(data_size, std::memory_order_relaxed);
-  g_pb_alloc_ns.fetch_add(ns(t0, t1), std::memory_order_relaxed);
-  g_pb_memcpy_ns.fetch_add(ns(t1, t2), std::memory_order_relaxed);
-  g_pb_rpc_ns.fetch_add(ns(t2, t3), std::memory_order_relaxed);
-  g_pb_free_ns.fetch_add(ns(t3, t4), std::memory_order_relaxed);
 }
 
 void Tag::PutBlob(const std::string &blob_name, const ctp::ipc::ShmPtr<> &data, size_t data_size,
