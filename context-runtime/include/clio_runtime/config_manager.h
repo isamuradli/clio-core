@@ -436,10 +436,13 @@ class ConfigManager : public ctp::BaseConfig {
   size_t main_segment_size_ = 0;
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
   // issue #783: metadata segment. Deliberately huge and never pre-faulted --
-  // shm_open + ftruncate + mmap is lazily populated, so the 8 GB reservation
-  // costs only the pages actually touched. NOTE: on a host whose /dev/shm is
-  // smaller than the live set, touching past the tmpfs limit raises SIGBUS,
-  // not ENOMEM. See CalculateMetadataSegmentSize().
+  // shm_open + ftruncate + mmap is lazily populated, so the reservation
+  // (default: the machine's RAM capacity, so metadata scales with the host)
+  // costs only the pages actually touched. Creation-time safety clamps live in
+  // ipc_manager.cc (half the cgroup-aware budget on Linux; 1 GB file cap
+  // elsewhere). NOTE: on a host whose /dev/shm is smaller than the live set,
+  // touching past the tmpfs limit raises SIGBUS, not ENOMEM. See
+  // CalculateMetadataSegmentSize().
   // 0 means "auto-calculate" — CalculateMetadataSegmentSize() supplies the
   // default. Initialising this to a non-zero size would make the explicit
   // override branch there permanently true and the documented sentinel a lie;

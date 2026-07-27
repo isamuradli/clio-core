@@ -640,12 +640,21 @@ size_t ConfigManager::CalculateMetadataSegmentSize() const {
     return metadata_segment_size_;
   }
 
-  // Default 8 GB. This is an address-space reservation, not an allocation: the
-  // segment is never pre-faulted, so only pages the runtime actually writes
-  // consume RAM. Sized generously because the CTE metadata cache (issue #783)
-  // holds one entry per live tag and blob, and growing the segment later would
-  // invalidate every client's mapping.
-  return ctp::Unit<size_t>::Gigabytes(8);
+  // Default: the machine's RAM capacity. This is an address-space RESERVATION,
+  // not an allocation: the segment is sparse and never pre-faulted, so only
+  // pages the runtime actually writes consume memory. Sizing the reservation
+  // like RAM means metadata capacity scales with the machine instead of hitting
+  // an arbitrary fixed ceiling (the old 8 GB default), and growing the segment
+  // later is impossible without invalidating every client's mapping — so
+  // reserve big up front. Safety is enforced downstream at creation time
+  // (ipc_manager.cc): on Linux the request is clamped to half the
+  // cgroup-aware process memory budget (containers!), and on non-Linux — where
+  // the segment is a real file, not memfd — it is capped at 1 GB.
+  size_t ram = ctp::SystemInfo::GetRamCapacity();
+  if (ram == 0) {
+    return ctp::Unit<size_t>::Gigabytes(8);  // introspection failed; old default
+  }
+  return ram;
 }
 
 size_t ConfigManager::CalculateQueueSegmentSize() const {

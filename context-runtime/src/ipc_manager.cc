@@ -944,8 +944,8 @@ bool IpcManager::ServerInitShm() {
     // issue #783: runtime-wide metadata segment (pid.3). Backs the CTE
     // shared-memory metadata cache. Deliberately NON-FATAL: if it cannot be
     // created the runtime still starts and every client simply falls back to
-    // the RPC path. That matters because the reservation is huge (8 GB by
-    // default) and a host with a small /dev/shm can legitimately refuse it --
+    // the RPC path. That matters because the reservation is huge (the host's
+    // RAM capacity by default) and a constrained host can legitimately refuse it --
     // losing an optimization is acceptable, failing to boot is not.
     metadata_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 3);
     std::string metadata_segment_name =
