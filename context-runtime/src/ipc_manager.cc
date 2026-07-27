@@ -763,23 +763,24 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
     return;
   }
 
-  // ALWAYS send SIGUSR1, never skip on active_=true. Past attempts to
-  // gate this on the park-flag tripped a lost-wakeup race at scale (4n
-  // 256m FPP) where the producer observed active_=true, skipped the
-  // signal, and the worker then stored active_=false and entered
-  // epoll_pwait2 before noticing the just-pushed task. The
-  // post-store-recheck handshake in Worker::SuspendMe is supposed to
-  // catch this but doesn't fire reliably under heavy multi-tier
-  // scheduling pressure. Skipping the tgkill saved a syscall; the
-  // observed cost was hangs that never recovered. The extra signal is
-  // absorbed harmlessly by signalfd — at worst the worker wakes one
-  // extra time and re-checks its (empty) queue. Worth it.
-
+  // Signal ONLY a PARKED worker. The caller has already pushed to `lane` (or to
+  // the event queue whose owner runs on this lane); the seq_cst fence here plus
+  // Worker::SuspendMe's seq_cst SetActive(false)+fence form a Dekker StoreLoad,
+  // so a running worker that we skip is GUARANTEED to observe the just-pushed
+  // task in its post-park re-check and not park. That closes the lost-wakeup the
+  // earlier gated attempt hit; and even a hypothetical residual miss self-heals
+  // within the worker's max_sleep cap (<=50ms) rather than hanging forever (that
+  // cap did not exist when the earlier attempt was reverted). On small requests
+  // this removes the per-op tgkill that made SHM lose to Redis's pipelined TCP.
   int tid = lane->GetTid();
   if (tid > 0) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (lane->IsActive()) {
+      return;  // worker is polling; it will drain this task without a wake
+    }
     int runtime_pid = runtime_pid_ ? runtime_pid_ : ctp::SystemInfo::GetPid();
 
-    // Send SIGUSR1 to the worker thread in the runtime process
+    // Send SIGUSR1 to the (parked) worker thread in the runtime process
     int result = ctp::lbm::EventManager::Signal(runtime_pid, tid);
     if (result != 0) {
       HLOG(kError,

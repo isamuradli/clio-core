@@ -1078,13 +1078,41 @@ void Worker::SuspendMe() {
     // 50ms max_sleep re-poll, which under the ARM weak-memory model fires
     // constantly and crawled cr_cli_cfs_parallel_stress into its timeout (x86
     // TSO mostly hid it).
+    // Unified park handshake — this is what lets producers STOP signalling a
+    // running worker (see IpcManager::AwakenWorker). Publish "parked" on BOTH
+    // wakeup surfaces before the final re-check: the inbound SHM shard
+    // (SetShardParked -> consumer_parked_, for client submits) AND this worker's
+    // lane (SetActive(false), for intra-runtime lane pushes + completion
+    // event-queue emplaces). The seq_cst fence between the publish and the
+    // re-check makes it a Dekker StoreLoad: a producer that pushes THEN loads
+    // the flag either sees us parked (and signals) or we see its task here (and
+    // skip the park). A residual miss self-heals within max_sleep (<=50ms) — the
+    // worker re-polls unconditionally — so gating can cost bounded latency but
+    // never a lost-wakeup hang (which is why the earlier gated attempt, made
+    // before the max_sleep cap existed, could hang and this one cannot).
+    TaskLane *park_lane = assigned_lane_.load(std::memory_order_acquire);
+    EventQueue *park_eq = event_queue_.load(std::memory_order_acquire);
+    if (park_lane) park_lane->SetActive(false);
     CLIO_IPC->SetShardParked(worker_id_, true);
-    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    bool late_work = false;
+    if (park_lane && !park_lane->Empty()) late_work = true;
+    if (!late_work && park_eq && !park_eq->Empty()) late_work = true;
+    if (!late_work) {
+      std::lock_guard<std::mutex> lk(park_mtx_);
+      for (EventQueue *aq : adopted_event_queues_) {
+        if (aq && !aq->Empty()) { late_work = true; break; }
+      }
+    }
+    if (!late_work && !CLIO_IPC->ShardEmpty(worker_id_)) late_work = true;
+    if (late_work) {
+      if (park_lane) park_lane->SetActive(true);
       CLIO_IPC->SetShardParked(worker_id_, false);
-      return;  // a request arrived during/before the park setup — go drain it
+      return;  // a task landed during park setup — go drain it
     }
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);
+    if (park_lane) park_lane->SetActive(true);
     CLIO_IPC->SetShardParked(worker_id_, false);
 
     if (nfds == 0) {
