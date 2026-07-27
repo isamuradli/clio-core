@@ -5198,6 +5198,30 @@ clio::run::TaskResume Runtime::AllocateFromTarget(
     CLIO_CO_RETURN;
   }
 
+  // INLINE fast path: bdev AllocateBlocks is a pure in-memory allocator call
+  // (no I/O, no co_await), yet going through AsyncAllocateBlocks costs a full
+  // intra-runtime task round trip PER ALLOCATION (self-sends force_enqueue, so
+  // it is enqueue -> another worker -> event-queue completion -> resume). On
+  // fresh-blob small writes that round trip was the DOMINANT cost: 4 KiB Put
+  // d64 runs 39k IOPS with per-op allocation vs 91k with none. For a LOCAL
+  // target whose bdev container lives in this process, call the allocator
+  // directly via Container::InlineOp — same per-worker-id sharding contract
+  // the task path already exercises. Remote/non-local targets and containers
+  // that decline (or ENOSPC) fall through to the task path unchanged.
+  if (target_info.target_query_.IsLocalMode()) {
+    auto inline_dc =
+        CLIO_POOL_MANAGER->GetStaticContainer(target_info.bdev_client_.pool_id_);
+    auto inline_c = inline_dc.get();  // ContainerHold keeps the container pinned
+    if (inline_c) {
+      clio::run::u64 inline_size = size;
+      if (inline_c->InlineOp(clio::run::bdev::Method::kAllocateBlocks,
+                             &inline_size, &out_blocks)) {
+        success = true;
+        CLIO_CO_RETURN;
+      }
+    }
+  }
+
   try {
     HLOG(
         kDebug,

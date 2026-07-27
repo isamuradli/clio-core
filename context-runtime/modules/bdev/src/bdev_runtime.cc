@@ -246,6 +246,30 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::InlineOp(clio::run::u32 method, void *in, void *out) {
+  // See the header comment: kAllocateBlocks only, pure in-memory, safe from
+  // any worker thread. Everything else falls back to the task path.
+  if (method != Method::kAllocateBlocks || in == nullptr || out == nullptr) {
+    return false;
+  }
+  auto *blocks = static_cast<std::vector<Block> *>(out);
+  if (bdev_type_ == BdevType::kNoop) {
+    return true;  // matches the handler: rc=0, no blocks
+  }
+  const clio::run::u64 size = *static_cast<clio::run::u64 *>(in);
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
+  const int worker_id = (worker != nullptr) ? static_cast<int>(worker->GetId()) : 0;
+  std::vector<Block> local_blocks;
+  if (!transport_->AllocateBlocks(static_cast<size_t>(size), worker_id,
+                                  local_blocks)) {
+    return false;  // ENOSPC etc. — task-path fallback owns error reporting
+  }
+  for (const auto &b : local_blocks) {
+    blocks->push_back(b);
+  }
+  return true;
+}
+
 clio::run::TaskResume Runtime::AllocateBlocks(clio::run::shared_ptr<AllocateBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
