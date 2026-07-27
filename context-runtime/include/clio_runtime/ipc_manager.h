@@ -746,7 +746,19 @@ class IpcManager {
    * @param lane Pointer to the TaskLane containing the worker's tid and active
    * status
    */
-  void AwakenWorker(TaskLane *lane);
+  /**
+   * Wake the worker that drains `lane`. By default the signal is SKIPPED when
+   * the lane's active_ flag says the worker is running — valid ONLY where the
+   * producer's push target is a queue the parked worker re-checks in
+   * Worker::SuspendMe (its assigned lane, its event queue, its inbound shard):
+   * there the Dekker publish/re-check pairing makes the skip race-free.
+   * Pass force=true when the push target is NOT in that re-check set (e.g.
+   * EnqueueNetTask pushes to a net_queue_ priority lane but wakes via the net
+   * worker's assigned lane — unpaired, so a skipped signal can strand the task
+   * for a full max_sleep, which serially crawled cte_reorganize_force_net into
+   * its timeout).
+   */
+  void AwakenWorker(TaskLane *lane, bool force = false);
 
   /**
    * Set the node ID in the shared memory header

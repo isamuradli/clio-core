@@ -754,7 +754,7 @@ void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
   HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
 }
 
-void IpcManager::AwakenWorker(TaskLane *lane) {
+void IpcManager::AwakenWorker(TaskLane *lane, bool force) {
   if (!lane) {
     // No lane to target — wake every worker so a task parked with no resolvable
     // owning lane is still re-checked (lost-wakeup safety net).
@@ -775,7 +775,7 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
   int tid = lane->GetTid();
   if (tid > 0) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (lane->IsActive()) {
+    if (!force && lane->IsActive()) {
       return;  // worker is polling; it will drain this task without a wake
     }
     int runtime_pid = runtime_pid_ ? runtime_pid_ : ctp::SystemInfo::GetPid();
@@ -2357,7 +2357,10 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
         break;
     }
     if (wake_lane) {
-      AwakenWorker(wake_lane);
+      // force=true: this push went to a net_queue_ priority lane, which is NOT
+      // in the net worker's SuspendMe re-check set — the parked-skip handshake
+      // is unpaired here, so the signal must be unconditional (see AwakenWorker).
+      AwakenWorker(wake_lane, /*force=*/true);
     }
     HLOG(kDebug,
          "[TRACE768] t={} EnqueueNetTask prio={} was_empty={} wake_lane={} "
