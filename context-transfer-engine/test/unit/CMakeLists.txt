@@ -104,6 +104,10 @@ add_executable(test_concurrent_io_stress
 # Same-blob write-race regression (#680 / xfstests generic/074). Many threads
 # write disjoint regions of ONE shared blob; the per-blob write token must keep
 # each region intact.
+add_executable(test_wakeup_never_miss
+    test_wakeup_never_miss.cc
+)
+
 add_executable(test_concurrent_same_blob
     test_concurrent_same_blob.cc
 )
@@ -397,6 +401,21 @@ target_link_libraries(test_concurrent_io_stress
     ${CMAKE_THREAD_LIBS_INIT}
 )
 target_include_directories(test_concurrent_io_stress PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+# Link test_wakeup_never_miss (gated signalling park/wake race) - same deps.
+target_link_libraries(test_wakeup_never_miss
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+target_include_directories(test_wakeup_never_miss PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
 
@@ -769,6 +788,21 @@ set_tests_properties(
 # the environment. 8 threads x 100 iters still races ~800 concurrent same-blob
 # extends, which is what detects the corruption; the 1500-iter soak is a local
 # knob (override SAME_BLOB_ITERS/SAME_BLOB_THREADS for a heavier run).
+# Targeted never-miss-wakeup regression (gated producer->worker signalling).
+# Cold-submits after every worker parks; a missed wake shows as the ~50ms
+# max_sleep self-heal latency signature on nearly every op (budgeted assert),
+# and a lost-wake hang trips the timeout. CI pins a lighter iteration count;
+# the 800-iter soak is the local default.
+add_test(NAME cr_wakeup_never_miss
+    COMMAND test_wakeup_never_miss)
+set_tests_properties(
+    cr_wakeup_never_miss
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "regression;wakeup;runtime"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;WAKEUP_ITERS=400"
+)
+
 add_test(NAME cte_concurrent_same_blob_all
     COMMAND test_concurrent_same_blob)
 
