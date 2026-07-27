@@ -251,6 +251,55 @@ TEST_CASE("Vectored PutBlob == N single puts, and segments apply in list order",
 // task with a zero-size or null-buffer segment must be REFUSED, not silently
 // half-applied. These are cheap, deterministic, and were the runtime's untested
 // error paths.
+TEST_CASE("Vectored PRIVATE-memory put/get roundtrip (strided)",
+          "[cte][vectored][private]") {
+  // The PrivBlobSegment overloads: put N strided regions from caller-owned
+  // char* buffers, read them back into different char* buffers, byte-compare.
+  // Under the embedded runtime this exercises the FromRaw direct paths and,
+  // on the second read, the all-or-nothing SHM fast path (RAM target).
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("vectored_priv_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+  const std::string blob = "priv_strided";
+
+  const size_t kSeg = 4096;
+  const int kN = 16;
+  const clio::run::u64 kStride = 2 * kSeg;  // strided: gap between regions
+
+  std::vector<std::vector<char>> src(kN), dst(kN);
+  std::vector<clio::cte::core::Client::PrivBlobSegment> put_segs,
+      get_segs;
+  for (int i = 0; i < kN; ++i) {
+    src[i].assign(kSeg, static_cast<char>((i % 250) + 1));
+    dst[i].assign(kSeg, 0);
+    put_segs.push_back(clio::cte::core::Client::PrivBlobSegment(
+        static_cast<clio::run::u64>(i) * kStride, kSeg, src[i].data()));
+    get_segs.push_back(clio::cte::core::Client::PrivBlobSegment(
+        static_cast<clio::run::u64>(i) * kStride, kSeg, dst[i].data()));
+  }
+
+  auto pv = cte->AsyncPutBlobVectored(tag_id, blob, put_segs);
+  REQUIRE(pv.get() != nullptr);
+  pv.Wait();
+  REQUIRE(pv->GetReturnCode() == 0);
+
+  for (int pass = 0; pass < 2; ++pass) {  // pass 2 favors the SHM fast path
+    for (auto &d : dst) std::fill(d.begin(), d.end(), 0);
+    auto gv = cte->AsyncGetBlobVectored(tag_id, blob, get_segs);
+    REQUIRE(gv.get() != nullptr);
+    gv.Wait();
+    REQUIRE(gv->GetReturnCode() == 0);
+    for (int i = 0; i < kN; ++i) {
+      REQUIRE(std::memcmp(dst[i].data(), src[i].data(), kSeg) == 0);
+    }
+  }
+  std::printf("[#820] private vectored roundtrip: %d strided x %zu B OK\n",
+              kN, kSeg);
+}
+
 TEST_CASE("Vectored I/O rejects malformed segments", "[cte][vectored][820]") {
   REQUIRE(g_fixture != nullptr);
   REQUIRE(g_fixture->initialized_);

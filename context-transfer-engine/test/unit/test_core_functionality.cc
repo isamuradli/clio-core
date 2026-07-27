@@ -2878,10 +2878,28 @@ TEST_CASE("CTE SHM cache direct payload read",
     double shm_us = static_cast<double>(shm_ns) / 1000.0 / kIters;
     double rpc_us = static_cast<double>(rpc_ns) / 1000.0 / kRpcIters;
     HLOG(kWarning,
-         "[#783 BENCH] PAYLOAD read {} bytes: SHM {} us/op vs RPC {} us/op -- "
-         "speedup {}x",
-         blob_size, shm_us, rpc_us, (rpc_us > 0 ? rpc_us / shm_us : 0.0));
-    REQUIRE(shm_us < rpc_us / 5.0);
+         "[#783 BENCH] PAYLOAD read {} bytes: raw TryReadBlobShm {} us/op vs "
+         "AsyncGetBlob {} us/op",
+         blob_size, shm_us, rpc_us);
+    // AsyncGetBlob now embeds this SHM fast path natively (TryShmGet), so the
+    // old ">=5x faster than the RPC" comparison is void — both loops serve
+    // from shared memory. Assert the inverse guard instead: the DEFAULT get
+    // stays within a small constant factor of the raw cache read (task
+    // synthesis is a few us at most). If someone unwires the fast path,
+    // AsyncGetBlob falls back to a full RPC (~50-150us) and this trips.
+    //
+    // EXCEPT under CLIO_FORCE_NET: there the fast path deliberately stands
+    // down (the force_net suites exist to exercise the network path), so
+    // AsyncGetBlob is a genuine net RPC and the ORIGINAL direction holds —
+    // the raw cache read must beat it handily.
+    const char *fn = std::getenv("CLIO_FORCE_NET");
+    const bool force_net = fn != nullptr && fn[0] != '\0' &&
+                           !(fn[0] == '0' && fn[1] == '\0');
+    if (force_net) {
+      REQUIRE(shm_us < rpc_us / 5.0);
+    } else {
+      REQUIRE(rpc_us < shm_us * 25.0 + 25.0);
+    }
   }
 }
 

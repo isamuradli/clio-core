@@ -519,6 +519,84 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * A vectored segment whose buffer is caller-owned PRIVATE memory (the
+   * private-path analog of BlobSegment). data_ is the source for a put and
+   * the destination for a get.
+   */
+  struct PrivBlobSegment {
+    clio::run::u64 blob_off_;
+    clio::run::u64 size_;
+    char *data_;
+    PrivBlobSegment(clio::run::u64 off, clio::run::u64 size, char *data)
+        : blob_off_(off), size_(size), data_(data) {}
+  };
+
+  /**
+   * PRIVATE-MEMORY vectored put: write N regions of one blob in a single task,
+   * each region sourced from a caller-owned private buffer. Completes the
+   * shared/private matrix for the vectored APIs (scalar Put/Get already have
+   * both, issues #823/#830).
+   *
+   * Runtime (co-located) mode: each segment's pointer is wrapped as a
+   * null-allocator ShmPtr and the bdev writes read straight from the caller's
+   * buffers — no staging, no copy. Client mode: all segments are staged
+   * through ONE SHM buffer (a single allocation + one memcpy per segment);
+   * ~PutBlobTask frees it via TASK_DATA_OWNER. The caller's buffers are free
+   * to reuse as soon as this returns in client mode, and after Wait() in
+   * runtime mode (same contract as the scalar private put).
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlobVectored(
+      const TagId &tag_id, const std::string &blob_name,
+      const std::vector<PrivBlobSegment> &segments, float score = -1.0f,
+      const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      auto task = ipc_manager->NewTask<PutBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+          blob_name.c_str(), static_cast<clio::run::u64>(0),
+          static_cast<clio::run::u64>(0), ctp::ipc::ShmPtr<>::GetNull(), score,
+          context, flags);
+      auto *t = task.get();
+      for (const auto &seg : segments) {
+        t->segments_.push_back(BlobSegment(
+            seg.blob_off_, seg.size_, ctp::ipc::ShmPtr<>::FromRaw(seg.data_)));
+      }
+      return ipc_manager->Send(task);
+    }
+
+    // Client mode: one staging allocation for all segments.
+    clio::run::u64 total = 0;
+    for (const auto &seg : segments) total += seg.size_;
+    ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(total);
+    if (staging.IsNull()) {
+      return clio::run::Future<PutBlobTask>();
+    }
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        blob_name.c_str(), static_cast<clio::run::u64>(0),
+        static_cast<clio::run::u64>(0), ctp::ipc::ShmPtr<>(staging.shm_),
+        score, context, flags);
+    auto *t = task.get();
+    clio::run::u64 off = 0;
+    for (const auto &seg : segments) {
+      std::memcpy(staging.ptr_ + off, seg.data_, seg.size_);
+      t->segments_.push_back(BlobSegment(
+          seg.blob_off_, seg.size_, ctp::ipc::ShmPtr<>(staging.shm_) + off));
+      off += seg.size_;
+    }
+    // blob_data_ carries the staging buffer purely for ownership: the PutBlob
+    // handler ignores blob_data_ whenever segments_ is non-empty, and setting
+    // TASK_DATA_OWNER after Send keeps the flag off the daemon's copy (same
+    // ordering rationale as the scalar private put).
+    auto fut = ipc_manager->Send(task);
+    t->SetFlags(TASK_DATA_OWNER);
+    return fut;
+  }
+
+  /**
    * Private-memory AsyncPutBlob (issue #830): write a blob region straight from
    * a caller-owned PRIVATE buffer (const char*), instead of making the caller
    * hand-manage a shared-memory buffer (allocate → copy in → pass ShmPtr →
@@ -644,6 +722,17 @@ class Client : public clio::run::ContainerClient {
    *                       destination ShmPtr for the shared overload; null
    *                       for the private overload — PostWait is a no-op)
    */
+  /** True when CLIO_FORCE_NET is set (force every op through the net path —
+   * the client-side read fast paths must stand down so the force_net test
+   * suites keep testing what they claim to). Read once. */
+  static bool ForceNetEnv() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_FORCE_NET");
+      return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return v;
+  }
+
   bool TryShmGet(const TagId &tag_id, const char *blob_name,
                  clio::run::u64 offset, clio::run::u64 size,
                  clio::run::u32 flags, char *dst,
@@ -651,7 +740,12 @@ class Client : public clio::run::ContainerClient {
                  const clio::run::PoolQuery &pool_query,
                  const Context &context,
                  clio::run::Future<GetBlobTask> *fut) {
-    if (dst == nullptr || size == 0 || flags != 0) {
+    // Emulated gets must reach the runtime (they model I/O, not perform it),
+    // and flagged gets keep full RPC semantics. CLIO_FORCE_NET exists to push
+    // every op through the network path (the force_net test suites); serving
+    // reads client-side would silently turn those suites into no-ops.
+    if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
+        ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {
@@ -815,6 +909,40 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
       const Context &context = Context()) {
     auto *ipc_manager = CLIO_CPU_IPC;
+
+    // Zero-IPC fast path, ALL-OR-NOTHING: if every segment can be served from
+    // the shared cache, return a synthesized complete future (same contract as
+    // the scalar TryShmGet). A partial hit falls through to the RPC, which
+    // simply overwrites any segments already copied — correct either way.
+    if (!segments.empty() && flags == 0 && !context.emulate_ &&
+        !ForceNetEnv() && (HasShmCache() || AttachShmCache())) {
+      bool all = true;
+      for (const auto &seg : segments) {
+        char *dst = seg.data_.IsNull()
+                        ? nullptr
+                        : ipc_manager->ToFullPtr<char>(
+                              seg.data_.template Cast<char>()).ptr_;
+        if (dst == nullptr || seg.size_ == 0 ||
+            !TryReadBlobShm(tag_id, blob_name, dst, seg.size_,
+                            seg.blob_off_)) {
+          all = false;
+          break;
+        }
+      }
+      if (all) {
+        auto task = ipc_manager->NewTask<GetBlobTask>(
+            clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+            static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
+            flags, ctp::ipc::ShmPtr<>::GetNull(), context);
+        clio::run::Future<GetBlobTask> fut(task->pool_id_, task->method_,
+                                           task);
+        fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+        task->return_code_ = 0;
+        task->SetComplete();
+        return fut;
+      }
+    }
+
     auto task = ipc_manager->NewTask<GetBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
         static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0), flags,
@@ -836,6 +964,106 @@ class Client : public clio::run::ContainerClient {
       const Context &context = Context()) {
     return AsyncGetBlobVectored(tag_id, blob_name.c_str(), segments, flags,
                                 pool_query, context);
+  }
+
+  /**
+   * PRIVATE-MEMORY vectored get: read N regions of one blob in a single task,
+   * each region landing in a caller-owned private buffer. Completes the
+   * shared/private matrix for the vectored APIs.
+   *
+   * Three paths, fastest first (mirrors the scalar private get):
+   *  - Shared-cache hit, ALL-OR-NOTHING: every segment is copied out of the
+   *    RAM bdev's shared segment with zero IPC and an already-COMPLETE future
+   *    is returned (real task, rc==0, dereferenceable).
+   *  - Runtime (co-located) mode: each segment's pointer is wrapped as a
+   *    null-allocator ShmPtr; the bdev reads land directly in the caller's
+   *    buffers.
+   *  - Client mode: staged through ONE SHM buffer; PostWait() scatters each
+   *    slice to its private destination (GetBlobTask::priv_scatter_) and
+   *    ~GetBlobTask frees the staging buffer via TASK_DATA_OWNER.
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlobVectored(
+      const TagId &tag_id, const std::string &blob_name,
+      const std::vector<PrivBlobSegment> &segments,
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    // Zero-IPC fast path (all-or-nothing across segments).
+    if (!segments.empty() && flags == 0 && !context.emulate_ &&
+        !ForceNetEnv() && (HasShmCache() || AttachShmCache())) {
+      bool all = true;
+      for (const auto &seg : segments) {
+        if (seg.data_ == nullptr || seg.size_ == 0 ||
+            !TryReadBlobShm(tag_id, blob_name, seg.data_, seg.size_,
+                            seg.blob_off_)) {
+          all = false;
+          break;
+        }
+      }
+      if (all) {
+        auto task = ipc_manager->NewTask<GetBlobTask>(
+            clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+            blob_name.c_str(), static_cast<clio::run::u64>(0),
+            static_cast<clio::run::u64>(0), flags,
+            ctp::ipc::ShmPtr<>::GetNull(), context);
+        clio::run::Future<GetBlobTask> fut(task->pool_id_, task->method_,
+                                           task);
+        fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+        task->return_code_ = 0;
+        task->SetComplete();
+        return fut;
+      }
+    }
+
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      auto task = ipc_manager->NewTask<GetBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+          blob_name.c_str(), static_cast<clio::run::u64>(0),
+          static_cast<clio::run::u64>(0), flags, ctp::ipc::ShmPtr<>::GetNull(),
+          context);
+      auto *t = task.get();
+      for (const auto &seg : segments) {
+        t->segments_.push_back(BlobSegment(
+            seg.blob_off_, seg.size_, ctp::ipc::ShmPtr<>::FromRaw(seg.data_)));
+      }
+      return ipc_manager->Send(task);
+    }
+
+    // Client mode: stage all segments through ONE SHM buffer and scatter on
+    // PostWait.
+    clio::run::u64 total = 0;
+    for (const auto &seg : segments) total += seg.size_;
+    ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(total);
+    if (staging.IsNull()) {
+      return clio::run::Future<GetBlobTask>();
+    }
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        blob_name.c_str(), static_cast<clio::run::u64>(0),
+        static_cast<clio::run::u64>(0), flags,
+        ctp::ipc::ShmPtr<>(staging.shm_), context);
+    auto *t = task.get();
+    auto *scatter = new std::vector<GetBlobTask::PrivScatter>();
+    scatter->reserve(segments.size());
+    clio::run::u64 off = 0;
+    for (const auto &seg : segments) {
+      t->segments_.push_back(BlobSegment(
+          seg.blob_off_, seg.size_, ctp::ipc::ShmPtr<>(staging.shm_) + off));
+      scatter->push_back(GetBlobTask::PrivScatter{
+          seg.data_, staging.ptr_ + off, static_cast<size_t>(seg.size_)});
+      off += seg.size_;
+    }
+    // priv_scatter_ is NOT serialized: it stays on this client instance for
+    // PostWait; the daemon's copy default-constructs to null. blob_data_
+    // carries the staging buffer for ownership only (the vectored handler
+    // reads segments_, not blob_data_); TASK_DATA_OWNER is set after Send so
+    // the flag never reaches the daemon's copy.
+    t->priv_scatter_ = scatter;
+    auto fut = ipc_manager->Send(task);
+    t->SetFlags(TASK_DATA_OWNER);
+    return fut;
   }
 
   /**

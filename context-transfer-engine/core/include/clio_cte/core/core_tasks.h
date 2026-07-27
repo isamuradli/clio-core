@@ -1611,6 +1611,20 @@ struct GetBlobTask : public clio::run::Task {
   char *priv_dest_ = nullptr;  // caller's private buffer (copy target)
   char *priv_src_ = nullptr;   // client-local addr of the SHM staging buffer
 
+  /**
+   * Vectored-private scatter list (client-local, NOT serialized): when a
+   * private-memory AsyncGetBlobVectored stages N segments through ONE SHM
+   * buffer in client mode, PostWait() copies each staged slice out to its
+   * caller-owned private destination. Heap-owned by the CLIENT task instance
+   * (deleted in the destructor); the daemon's deserialized copy stays null.
+   */
+  struct PrivScatter {
+    char *dst_;
+    const char *src_;
+    size_t len_;
+  };
+  std::vector<PrivScatter> *priv_scatter_ = nullptr;
+
   // SHM constructor
   CTP_CROSS_FUN GetBlobTask()
       : clio::run::Task(),
@@ -1677,6 +1691,7 @@ struct GetBlobTask : public clio::run::Task {
         ipc_manager->FreeBuffer(blob_data_.template Cast<char>());
       }
     }
+    delete priv_scatter_;  // client-local vectored-private scatter list
 #endif
   }
 
@@ -1693,6 +1708,15 @@ struct GetBlobTask : public clio::run::Task {
     if (priv_dest_ != nullptr && priv_src_ != nullptr && size_ > 0 &&
         GetReturnCode() == 0) {
       std::memcpy(priv_dest_, priv_src_, size_);
+    }
+    // Vectored-private (client mode): scatter each staged slice out to its
+    // caller-owned destination. Null everywhere else.
+    if (priv_scatter_ != nullptr && GetReturnCode() == 0) {
+      for (const auto &s : *priv_scatter_) {
+        if (s.dst_ != nullptr && s.src_ != nullptr && s.len_ > 0) {
+          std::memcpy(s.dst_, s.src_, s.len_);
+        }
+      }
     }
 #endif
   }
