@@ -618,6 +618,59 @@ class Client : public clio::run::ContainerClient {
    * @param pool_query Pool query for task routing (default: Dynamic)
    * @param context Context for I/O emulation control (issue #747)
    */
+  /**
+   * The zero-IPC read fast path, NATIVE to AsyncGetBlob (issues #783/#817).
+   *
+   * If the whole get can be served from the shared metadata cache + RAM-bdev
+   * segment, copy it into `dst` and set *fut to an already-COMPLETE future:
+   * a real GetBlobTask (never Sent) with return_code_==0 and IsComplete()
+   * set, so Wait() returns instantly and the task is safe to dereference —
+   * every caller gets the optimization with no special-casing, exactly like
+   * the PutBlob path shapes.
+   *
+   * TryReadBlobShm carries its own guards (cache attached and ready, blob
+   * RAM-resident and direct-readable, placement generation unchanged across
+   * the copy); any miss returns false and the caller Sends the RPC task, so
+   * this is only ever faster, never wrong for a settled blob. Semantics note:
+   * the mirror is republished AFTER the authoritative update, so a reader
+   * racing its OWN just-completed rewrite of the same bytes can briefly see
+   * the previous value (clio-fs drains overlapping writes first for exactly
+   * this reason). Gated to flags==0 so flagged gets keep full RPC semantics.
+   * Attaches lazily: a client can come up before its pool is composed, and a
+   * one-shot attach at init would pin that process to the RPC path forever.
+   *
+   * @param dst            where the bytes land (shared OR private memory)
+   * @param task_blob_data blob_data_ recorded on the synthesized task (the
+   *                       destination ShmPtr for the shared overload; null
+   *                       for the private overload — PostWait is a no-op)
+   */
+  bool TryShmGet(const TagId &tag_id, const char *blob_name,
+                 clio::run::u64 offset, clio::run::u64 size,
+                 clio::run::u32 flags, char *dst,
+                 ctp::ipc::ShmPtr<> task_blob_data,
+                 const clio::run::PoolQuery &pool_query,
+                 const Context &context,
+                 clio::run::Future<GetBlobTask> *fut) {
+    if (dst == nullptr || size == 0 || flags != 0) {
+      return false;
+    }
+    if (!HasShmCache() && !AttachShmCache()) {
+      return false;
+    }
+    if (!TryReadBlobShm(tag_id, blob_name, dst, size, offset)) {
+      return false;
+    }
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, task_blob_data, context);
+    *fut = clio::run::Future<GetBlobTask>(task->pool_id_, task->method_, task);
+    fut->GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+    task->return_code_ = 0;
+    task->SetComplete();
+    return true;
+  }
+
   clio::run::Future<GetBlobTask> AsyncGetBlob(
       const TagId &tag_id,
       const char *blob_name,
@@ -627,6 +680,19 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
       const Context &context = Context()) {
     auto *ipc_manager = CLIO_CPU_IPC;
+
+    // DEFAULT-ON zero-IPC read — see TryShmGet above.
+    {
+      char *dst = blob_data.IsNull()
+                      ? nullptr
+                      : ipc_manager->ToFullPtr<char>(
+                            blob_data.template Cast<char>()).ptr_;
+      clio::run::Future<GetBlobTask> fut;
+      if (TryShmGet(tag_id, blob_name, offset, size, flags, dst, blob_data,
+                    pool_query, context, &fut)) {
+        return fut;
+      }
+    }
 
     auto task = ipc_manager->NewTask<GetBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
@@ -655,10 +721,10 @@ class Client : public clio::run::ContainerClient {
    * free) as the ShmPtr overload above requires.
    *
    * Three paths, fastest first:
-   *  - Shared-cache hit: the bytes are copied out of the RAM bdev's shared
-   *    segment with ZERO IPC and an already-satisfied (empty) Future is
-   *    returned, so Wait() returns immediately. Same fast path the synchronous
-   *    Tag::GetBlob(char*) uses.
+   *  - Shared-cache hit (TryShmGet): the bytes are copied out of the RAM
+   *    bdev's shared segment with ZERO IPC and an already-COMPLETE Future is
+   *    returned (real task, rc==0) — Wait() returns immediately and the task
+   *    is safe to dereference, same contract as every other path.
    *  - Runtime (co-located) mode: the daemon shares this address space, so the
    *    private pointer is wrapped as a null-allocator ShmPtr — IpcManager::
    *    ToFullPtr resolves such a pointer's offset AS the absolute address — and
@@ -670,11 +736,10 @@ class Client : public clio::run::ContainerClient {
    *    GetBlobTask::PostWait() copies the staged bytes into the caller's buffer
    *    when the read completes.
    *
-   * @return A Future over the read. On the cache-hit path the Future is EMPTY
-   *         (Wait() succeeds immediately; do not dereference it). On the other
-   *         paths the task is readable after Wait() (GetReturnCode()==0 on
-   *         success). An empty Future is also returned if SHM staging could not
-   *         be allocated in client mode.
+   * @return A Future over the read; after Wait() the task is dereferenceable
+   *         on every path (GetReturnCode()==0 on success), including the
+   *         cache-hit path. The ONLY empty Future is the client-mode
+   *         staging-allocation failure.
    */
   clio::run::Future<GetBlobTask> AsyncGetBlob(
       const TagId &tag_id, const std::string &blob_name,
@@ -685,11 +750,16 @@ class Client : public clio::run::ContainerClient {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     // Fastest path: node-local RAM-resident blob → copy straight out of shared
-    // memory. A miss (not cached / not direct-readable / placement moved) falls
-    // through to a real task, so this is only ever faster, never wrong.
-    if (priv_data != nullptr && size > 0 && HasShmCache() &&
-        TryReadBlobShm(tag_id, blob_name, priv_data, size, offset)) {
-      return clio::run::Future<GetBlobTask>();
+    // memory (see TryShmGet). The synthesized task's blob_data_ stays null and
+    // priv_dest_/priv_src_ default null, so PostWait and ~GetBlobTask are
+    // no-ops — the bytes are already in the caller's buffer.
+    {
+      clio::run::Future<GetBlobTask> fut;
+      if (TryShmGet(tag_id, blob_name.c_str(), offset, size, flags, priv_data,
+                    ctp::ipc::ShmPtr<>::GetNull(), pool_query, context,
+                    &fut)) {
+        return fut;
+      }
     }
 
     if (CLIO_RUNTIME_MANAGER->IsRuntime()) {

@@ -197,38 +197,21 @@ void Tag::GetBlob(const std::string &blob_name, char *data, size_t data_size, si
     throw std::invalid_argument("data buffer must be pre-allocated by caller");
   }
 
-  // issue #783 fast path: for a node-local RAM-resident blob, copy the bytes
-  // straight out of shared memory -- no IPC, no staging buffer, no allocation.
-  // Any failure (not cached, not direct-readable, placement moved mid-copy)
-  // falls through to the RPC path below, so this can only ever be faster or
-  // equivalent, never wrong.
-  {
-    auto *cte_client = CLIO_CTE_CLIENT;
-    if (cte_client->HasShmCache() &&
-        cte_client->TryReadBlobShm(tag_id_, blob_name, data, data_size, off)) {
-      return;
-    }
-  }
-
-  // Allocate shared memory for the data
-  auto *ipc_manager = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm_fullptr = ipc_manager->AllocateBuffer(data_size);
-
-  if (shm_fullptr.IsNull()) {
+  // The zero-IPC fast path is NATIVE to CoreClient::AsyncGetBlob now (issue
+  // #783/#817 via TryShmGet) — delegating to the private-buffer overload gets
+  // shared-cache hit, runtime-mode direct read, and client-mode staging in one
+  // place instead of duplicating the cache probe here.
+  auto fut = CLIO_CTE_CLIENT->AsyncGetBlob(tag_id_, blob_name, off, data_size,
+                                           0, data);
+  if (fut.get() == nullptr) {
+    // Only reachable when client-mode SHM staging could not be allocated.
     throw std::runtime_error("Failed to allocate shared memory for GetBlob");
   }
-
-  // Convert to ctp::ipc::ShmPtr<> for API call
-  ctp::ipc::ShmPtr<> shm_ptr(shm_fullptr.shm_);
-
-  // Call SHM version
-  GetBlob(blob_name, shm_ptr, data_size, off);
-
-  // Copy data from shared memory to output buffer
-  memcpy(data, shm_fullptr.ptr_, data_size);
-
-  // Explicitly free shared memory buffer
-  ipc_manager->FreeBuffer(shm_fullptr);
+  fut.Wait();
+  if (fut->GetReturnCode() != 0) {
+    throw std::runtime_error("GetBlob failed with code " +
+                             std::to_string(fut->GetReturnCode()));
+  }
 }
 
 clio::run::Future<GetBlobTask> Tag::AsyncGetBlob(const std::string &blob_name,
