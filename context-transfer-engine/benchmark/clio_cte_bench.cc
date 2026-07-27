@@ -130,9 +130,16 @@ class CTEBenchmark {
               std::vector<long long> &times, std::vector<clio_bench::u64> &ops) {
     auto *cte = CLIO_CTE_CLIENT;
     auto put_shm = CLIO_IPC->AllocateBuffer(a_.io_size);
-    auto get_shm = CLIO_IPC->AllocateBuffer(a_.io_size);
+    // One destination REGION PER IN-FLIGHT GET. With a single shared buffer
+    // the Get loop had to Wait() each op before issuing the next (concurrent
+    // reads would race on the destination), which silently serialized Gets and
+    // made --depth a no-op for reads: Get d64 measured ~= Get d1 while the
+    // properly-pipelined Puts scaled 5x. Per-slot regions let Gets batch
+    // exactly like Puts.
+    const size_t get_slots = a_.depth > 0 ? static_cast<size_t>(a_.depth) : 1;
+    auto get_shm = CLIO_IPC->AllocateBuffer(a_.io_size * get_slots);
     std::memset(put_shm.ptr_, static_cast<int>(tid & 0xFF), a_.io_size);
-    std::memset(get_shm.ptr_, 0, a_.io_size);  // pre-fault dest pages
+    std::memset(get_shm.ptr_, 0, a_.io_size * get_slots);  // pre-fault dest pages
     ctp::ipc::ShmPtr<> put_ptr = put_shm.shm_.template Cast<void>();
     ctp::ipc::ShmPtr<> get_ptr = get_shm.shm_.template Cast<void>();
 
@@ -189,10 +196,19 @@ class CTEBenchmark {
         }
       }
       if (mode == Mode::kGet || mode == Mode::kPutGet) {
+        // Pipeline exactly like the Put arm: submit `batch` async Gets (each
+        // into its OWN destination slot), then drain. This is what makes
+        // --depth meaningful for reads.
+        std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> gts;
+        gts.reserve(batch);
         for (long j = 0; j < batch; ++j) {
-          auto t = cte->AsyncGetBlob(
+          ctp::ipc::ShmPtr<> slot =
+              get_ptr + static_cast<size_t>(j) * a_.io_size;
+          gts.push_back(cte->AsyncGetBlob(
               tag_id, blob_name(KeyIndex(i + j, per_thread_blobs_)), 0,
-              a_.io_size, 0, get_ptr, pq);
+              a_.io_size, 0, slot, pq));
+        }
+        for (auto &t : gts) {
           t.Wait();
           if (t->return_code_.load() != 0) {
             HLOG(kError, "[t{}] GetBlob rc={}", tid, t->return_code_.load());
