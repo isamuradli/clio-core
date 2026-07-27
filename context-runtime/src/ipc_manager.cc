@@ -3346,6 +3346,14 @@ bool IpcManager::DrainShmResponses() {
     return false;
   }
   bool any = false;
+  // The waiter that drains a response inline (RecvOut spin path) is THIS thread;
+  // it will observe IsComplete on its next spin and needs no wake. Signalling it
+  // is a wasted SYS_tgkill per response — and on a single pipelining thread that
+  // is one syscall PER OP that never amortizes with depth (the whole reason CTE
+  // pipelining lagged Redis, whose 64 replies cost ~1 read). Skip the self-wake;
+  // still signal OTHER (possibly parked) waiters whose responses we demux.
+  const int my_pid = static_cast<int>(ctp::SystemInfo::GetPid());
+  const int my_tid = static_cast<int>(ctp::SystemInfo::GetTid());
   while (true) {
     // Cheap check before allocating: a spinning waiter calls this every
     // iteration, so allocating a LoadTaskArchive only to hit EAGAIN on an empty
@@ -3383,7 +3391,9 @@ bool IpcManager::DrainShmResponses() {
     std::atomic_thread_fence(std::memory_order_release);
     task->SetNewData();
     task->SetComplete();
-    if (task->WaiterPid() != 0) {
+    if (task->WaiterPid() != 0 &&
+        !(static_cast<int>(task->WaiterPid()) == my_pid &&
+          static_cast<int>(task->WaiterTid()) == my_tid)) {
       ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
                                      static_cast<int>(task->WaiterTid()));
     }
