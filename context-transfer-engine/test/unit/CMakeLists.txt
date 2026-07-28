@@ -1410,6 +1410,53 @@ set_tests_properties(cte_getblob_priv_separate PROPERTIES
     RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 180
     LABELS "unit;core;cte;msan_skip")
+
+# Write-side mirror (issue #830): private-memory AsyncPutBlob. Same two
+# configurations as the getblob_priv pair above — inline (co-located runtime,
+# zero-copy FromRaw write) and separate (pure client, TASK_DATA_OWNER staging).
+add_executable(test_putblob_priv
+    test_putblob_priv.cc
+)
+
+target_include_directories(test_putblob_priv PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_compile_definitions(test_putblob_priv PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+target_link_libraries(test_putblob_priv
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_dependencies(test_putblob_priv
+    clio_run
+    clio_cte_core_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+
+add_test(NAME cte_putblob_priv_inline
+    COMMAND test_putblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_putblob_priv_inline PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 120
+    LABELS "unit;core;cte;msan_skip")
+
+add_test(NAME cte_putblob_priv_separate
+    COMMAND test_putblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_putblob_priv_separate PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env};CLIO_PUTBLOB_PRIV_MODE=separate"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "unit;core;cte;msan_skip")
 endif()  # UNIX
 
 add_executable(test_cte_gpu_metadata_cache

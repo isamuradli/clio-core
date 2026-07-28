@@ -625,8 +625,9 @@ class Client : public clio::run::ContainerClient {
    * client-visible pin/lease against reorganization; left as a follow-up.
    *
    * @return A Future over the put; readable after Wait() (GetReturnCode()==0 on
-   *         success). An empty Future is returned only if SHM staging could not
-   *         be allocated in client mode.
+   *         success). An empty Future (Wait() returns immediately, get() is
+   *         null) is returned for a degenerate request (size==0 or null
+   *         source) or when SHM staging could not be allocated in client mode.
    */
   clio::run::Future<PutBlobTask> AsyncPutBlob(
       const TagId &tag_id, const std::string &blob_name,
@@ -636,12 +637,16 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
-    // A zero-length put carries no payload; route it through the ShmPtr overload
-    // with a null buffer so the two modes below never see size 0.
+    // Degenerate requests (no payload / no source) are rejected CLIENT-SIDE
+    // with an empty Future — same contract as the staging-allocation failure
+    // below: Wait() succeeds immediately, get() is null, and nothing reaches
+    // the runtime. The earlier version routed these through the ShmPtr
+    // overload with a null buffer, which the co-located handler rejects
+    // cleanly — but in CLIENT mode Send's serialization bulk-exposes `size`
+    // bytes from the null pointer and segfaults (cte_putblob_priv_separate,
+    // "rejects degenerate requests").
     if (size == 0 || priv_data == nullptr) {
-      return AsyncPutBlob(tag_id, blob_name.c_str(), offset, size,
-                          ctp::ipc::ShmPtr<>::GetNull(), score, context, flags,
-                          pool_query);
+      return clio::run::Future<PutBlobTask>();
     }
 
     if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
