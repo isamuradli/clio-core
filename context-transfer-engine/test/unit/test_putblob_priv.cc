@@ -113,16 +113,14 @@ class Fixture {
   }
 
   /** Inline: this process IS the runtime. Register a RAM target by hand. */
-  bool InitInline() {
-    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
-      return false;
-    }
-    std::this_thread::sleep_for(300ms);
-    if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-      return false;
-    }
-    std::this_thread::sleep_for(200ms);
-
+  /** Register a RAM target into the pool CLIO_CTE_CLIENT actually talks to
+   *  (the default clio_cte_core pool). Shared by the inline and separate
+   *  fixtures so both place the target where the client's PutBlobs look for
+   *  it — same fix as test_getblob_priv: the compose in separate mode
+   *  registers its storage into the COMPOSED pool (516.0) while the client
+   *  talks to the default pool (512.0), so without this the setup put fails
+   *  with rc 11 ("no targets") on the deps-cpu/Boost CI configs. */
+  static bool RegisterRamTarget() {
     auto *cte = CLIO_CTE_CLIENT;
     clio::run::PoolId bdev_pool_id(916, 0);
     clio::run::bdev::Client bdev_client(bdev_pool_id);
@@ -137,10 +135,23 @@ class Fixture {
                                         clio::run::PoolQuery::Local(),
                                         bdev_pool_id);
     reg.Wait();
-    if (reg->GetReturnCode() != 0) return false;
+    return reg->GetReturnCode() == 0;
+  }
+
+  bool InitInline() {
+    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+      return false;
+    }
+    std::this_thread::sleep_for(300ms);
+    if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+      return false;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    if (!RegisterRamTarget()) return false;
     // Best-effort: attach the SHM metadata cache so the zero-IPC read-back
     // path can run where available.
-    (void)cte->AttachShmCache();
+    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 
@@ -182,6 +193,13 @@ class Fixture {
       return false;
     }
     if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+      return false;
+    }
+    // Register the RAM target into the pool this client actually uses — the
+    // daemon services the bdev create + RegisterTarget exactly as inline mode
+    // does. Without this the composed pool holds the only target and every
+    // put from the client's default pool fails rc 11 (see RegisterRamTarget).
+    if (!RegisterRamTarget()) {
       return false;
     }
     (void)CLIO_CTE_CLIENT->AttachShmCache();
