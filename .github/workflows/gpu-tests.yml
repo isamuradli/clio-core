@@ -1,16 +1,14 @@
 name: GPU Tests (CUDA)
 
 on:
+  # Push to main/dev runs UNCONDITIONALLY -- no path filter. A merge is the
+  # gate that decides what lands, so it must exercise everything; a path
+  # filter here meant a merge touching only, say, CI or docs skipped the CUDA
+  # compile entirely, and the next unrelated merge inherited the breakage.
+  # PRs keep the path filter (below): breadth on every PR commit costs queue
+  # time for little signal, and the merge sweep still gates the branch.
   push:
     branches: [main, dev]
-    paths: &gpu_paths
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
   # Also run on PRs touching the same paths. Previously this workflow fired
   # ONLY on push to main/dev, so a change that broke the CUDA device compile
   # was invisible in PR review and only surfaced after merge, on dev — which
@@ -20,7 +18,14 @@ on:
   # still skip it.
   pull_request:
     branches: [main, dev]
-    paths: *gpu_paths
+    paths:
+      - 'context-runtime/**'
+      - 'context-transfer-engine/**'
+      - 'context-transport-primitives/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'installers/conda/**'
+      - '.github/workflows/gpu-tests.yml'
   workflow_dispatch:
 
 # One in-flight run per ref; a new push to a PR branch cancels the previous
@@ -28,7 +33,12 @@ on:
 # build is ~15 min).
 concurrency:
   group: gpu-tests-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PR branches only. On a SHARED branch (main/dev)
+  # github.ref is identical for every merge, so `true` here made each merge
+  # cancel the PREVIOUS merge's validation mid-flight -- which is exactly the
+  # "lots of skipped tests after merging" symptom, and it silently drops the
+  # coverage that decides what is on dev. A merge's run must always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-cuda-conda:

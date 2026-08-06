@@ -41,7 +41,12 @@ on:
 
 concurrency:
   group: build-core-containers-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PR branches only. On a SHARED branch (main/dev)
+  # github.ref is identical for every merge, so `true` here made each merge
+  # cancel the PREVIOUS merge's validation mid-flight -- which is exactly the
+  # "lots of skipped tests after merging" symptom, and it silently drops the
+  # coverage that decides what is on dev. A merge's run must always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Present on push + internal-branch PRs; empty on forked-PR runs, which skips
