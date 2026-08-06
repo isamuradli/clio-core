@@ -40,6 +40,17 @@ class ClioCteLibfuse(Service):
                 'default': '-f',
             },
             {
+                'name': 'cte_pool',
+                'msg': ('Pool the FUSE client binds its CTE client to, as '
+                        '"<major>.<minor>". Empty binds to the CTE core '
+                        '(512.0). Set this to the TOP of an interposer '
+                        'chain -- e.g. 564.0 for indexer -> cache -> '
+                        'replication -> core -- otherwise the chain is '
+                        'bypassed and no I/O traverses it.'),
+                'type': str,
+                'default': '',
+            },
+            {
                 'name': 'sleep',
                 'msg': 'Seconds to wait after launch for the FUSE handshake.',
                 'type': int,
@@ -51,6 +62,18 @@ class ClioCteLibfuse(Service):
         super()._configure(**kwargs)
         self.setenv('CTP_LOG_LEVEL', self.config['log_level'])
         self.setenv('CLIO_WITH_RUNTIME', '0')
+
+        # Bind the adapter's CTE client to a specific pool (issue #886).
+        # Interposers forward every method they do not override, so a
+        # client pointed at core still WORKS with a chain deployed -- it
+        # just enters below every interposer, and the cache/replication/
+        # indexer pools sit there doing nothing while their sweeps run.
+        # There is no error and no log line for that; a benchmark simply
+        # reports the chain as free. Hence: set it explicitly, or leave
+        # empty and inherit the 512.0 default deliberately.
+        cte_pool = str(self.config.get('cte_pool', '') or '').strip()
+        if cte_pool:
+            self.setenv('CLIO_CTE_POOL', cte_pool)
 
     def start(self):
         mp = self.config['mountpoint']
