@@ -27,9 +27,11 @@
 #   jarvis ppl submit <abs path>/distributed.yaml
 #
 #   Needs jarvis-cd @ dev for container_fakeroot, run_timeout, builtin.ior's
-#   container path + num_nodes, builtin.juicefs meta_use_head, and
-#   jarvis_cd.util.container_utils. Env overrides read by pre_cmds at job
-#   runtime: PERF_EVAL_VIEW, JARVIS_VENV, CLIO_REPO — see single_node.yaml.
+#   container path + num_nodes, builtin.juicefs meta_use_head, host_pkgs, and
+#   jarvis_cd.util.container_utils. apptainer is provisioned by the
+#   config.host_pkgs block below — there is no spack view to build by hand.
+#   Env overrides read by pre_cmds at job runtime: JARVIS_VENV, CLIO_REPO,
+#   SPACK_ROOT — see single_node.yaml.
 #
 # Output:
 #   ${HOME}/distributed_results/results.csv — 3 rows, one per node count.
@@ -54,14 +56,18 @@ scheduler:
   pre_cmds:
     # 1) fakeroot GID fix on the head node (see single_node.yaml).
     - 'if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi'
-    # 2) Host launcher toolchain: spack-built apptainer (via a spack view under
-    #    /mnt/common, seen on every node) + the jarvis venv, prepended to PATH.
-    #    Pure `export` -- no `spack load` / `conda activate` under `set -euo
-    #    pipefail`. Override PERF_EVAL_VIEW / JARVIS_VENV before submitting.
-    - 'export PATH="${PERF_EVAL_VIEW:-/mnt/common/$USER/perf-eval-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
-    - 'command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer not on PATH (view: ${PERF_EVAL_VIEW:-/mnt/common/$USER/perf-eval-view})" >&2; exit 1; }'
-    - 'command -v jarvis    >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
-    - 'echo "toolchain: apptainer=$(command -v apptainer) jarvis=$(command -v jarvis)"'
+    # 2) Host launcher toolchain (see single_node.yaml for the full rationale).
+    #    apptainer is declared under config.host_pkgs below and provisioned by
+    #    jarvis itself -- no spack view, no PERF_EVAL_VIEW. The shell still
+    #    needs the jarvis venv (the sbatch script calls bare `jarvis ppl run`)
+    #    and, best-effort, apptainer out of its spack prefix for the step-4
+    #    reap and the step-5 preflight. $APPTAINER_PREFIX is reused by both.
+    #    Every node reads the same spack install tree, so one resolution here
+    #    is valid cluster-wide.
+    - 'APPTAINER_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack location -i apptainer~suid 2>/dev/null || true )"'
+    - 'PATH="${APPTAINER_PREFIX:+$APPTAINER_PREFIX/bin:}${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'command -v jarvis >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - 'echo "toolchain: jarvis=$(command -v jarvis) spack_root=${SPACK_ROOT:-$HOME/spack} apptainer=$(command -v apptainer || echo "<not yet installed; host_pkgs will install it>")"'
     # 3) SIF gate ($SIF is reused by the preflight below — one bash process)
     - 'JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)'
     - 'SIF="$JSD/containers/iowarp-perf-eval.sif"; [ -n "$JSD" ] && [ -f "$SIF" ] || { echo "ERROR: SIF missing: $SIF — build via jarvis-cd docker/build_perf_eval_image.sh" >&2; exit 1; }'
@@ -83,12 +89,23 @@ scheduler:
       ' || echo "WARNING: per-node prep rc=$? — continuing"
     # 5) fakeroot preflight: a real throwaway --fakeroot instance per node
     #    over ssh (same hop jarvis uses). Broken-uidmap nodes fail here in
-    #    seconds; the job aborts with a ready resubmit hint.
+    #    seconds; the job aborts with a ready resubmit hint. The remote PATH
+    #    comes from $APPTAINER_PREFIX (step 2), which every node can read
+    #    because the spack install tree is on a shared FS.
+    #
+    #    SKIPPED when apptainer is not installed yet: on a first-ever run
+    #    host_pkgs installs it after this point, so preflighting here would
+    #    fail all four nodes for the one reason that is not a uidmap problem.
+    #    The tradeoff is that a broken-uidmap node is then caught later, by
+    #    jarvis, instead of here -- only on that first run.
     - |-
+      if [ -z "$APPTAINER_PREFIX" ]; then
+        echo "SKIP fakeroot preflight: apptainer not installed yet (host_pkgs will install it)"
+      else
       BAD=""
       for h in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
         if env -u LD_LIBRARY_PATH ssh -n -o BatchMode=yes "$h" \
-            "PATH=\"${PERF_EVAL_VIEW:-/mnt/common/$USER/perf-eval-view}/bin:\$PATH\" apptainer instance start --fakeroot $SIF pf_$$ >/dev/null 2>&1 && apptainer instance stop pf_$$ >/dev/null 2>&1"; then
+            "PATH=\"$APPTAINER_PREFIX/bin:\$PATH\" apptainer instance start --fakeroot $SIF pf_$$ >/dev/null 2>&1 && apptainer instance stop pf_$$ >/dev/null 2>&1"; then
           echo "fakeroot OK: $h"
         else
           echo "fakeroot FAILED: $h"
@@ -99,6 +116,7 @@ scheduler:
         echo "ERROR: fakeroot preflight failed on: $BAD" >&2
         echo "Resubmit excluding them: set exclude: \"$BAD\" in the scheduler block, or: sbatch --exclude=$BAD <pipeline shared_dir>/submit.slurm" >&2
         exit 1
+      fi
       fi
     # 6) experiment dirs + repo registration + clean-slate results
     - 'mkdir -p "$HOME/perf_eval_scratch/distributed/nfs" "$HOME/perf_eval_scratch/distributed/jfs_data" "$HOME/cte_libfuse_perf_eval" "$HOME/distributed_results"'
@@ -112,6 +130,15 @@ config:
 
   # MUST stay literally identical to scheduler.hostfile above.
   hostfile: "${HOME}/.jarvis-perf-eval/distributed_hostfile.txt"
+
+  # ---- Host prerequisites ------------------------------------------------
+  # See single_node.yaml for the full rationale, including why `~suid` is
+  # mandatory for the rootless --fakeroot path. Declared once and satisfied
+  # once: jarvis runs on the head node, and the spack install tree is on a
+  # shared FS, so the resulting prefix is readable from all four nodes.
+  host_pkgs:
+    - install_method: spack
+      install_query: apptainer~suid
 
   # The OUTER jarvis Pssh between nodes brings up the per-node containers, and
   # this string ALSO becomes mpiexec's --mca plm_rsh_agent: the ssh that spawns

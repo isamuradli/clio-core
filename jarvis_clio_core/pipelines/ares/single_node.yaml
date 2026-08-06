@@ -26,11 +26,12 @@
 #   jarvis ppl submit <abs path>/single_node.yaml
 #
 #   Needs jarvis-cd @ dev for container_fakeroot, run_timeout, builtin.ior's
-#   container path, builtin.juicefs, and jarvis_cd.util.container_utils (which
-#   the clio_* packages import). pre_cmds expand when the JOB runs, so export
-#   any overrides before submitting: PERF_EVAL_VIEW (spack view with apptainer,
-#   default /mnt/common/$USER/perf-eval-view), JARVIS_VENV (jarvis venv, default
-#   $HOME/jarvis-venv), CLIO_REPO (this checkout, default $HOME/clio-core).
+#   container path, builtin.juicefs, host_pkgs, and jarvis_cd.util.container_utils
+#   (which the clio_* packages import). apptainer is provisioned by the
+#   config.host_pkgs block below -- there is no spack view to build by hand.
+#   pre_cmds expand when the JOB runs, so export any overrides before
+#   submitting: JARVIS_VENV (jarvis venv, default $HOME/jarvis-venv), CLIO_REPO
+#   (this checkout, default $HOME/clio-core), SPACK_ROOT (default $HOME/spack).
 #
 # Output:
 #   ${HOME}/single_node_results/results.csv — 24 rows. Per-driver columns:
@@ -60,15 +61,29 @@ scheduler:
     #    rootless --fakeroot validates the GID map against group == $USER.
     #    Guarded self-re-exec of this job script under the personal group.
     - 'if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi'
-    # 2) The one place the host launcher toolchain is brought up: spack-built
-    #    apptainer (via a spack view under /mnt/common, seen on every node) plus
-    #    the jarvis venv, prepended to PATH. Pure `export` -- no `spack load` /
-    #    `conda activate` (shell functions that misbehave under `set -euo
-    #    pipefail`). Override PERF_EVAL_VIEW / JARVIS_VENV before submitting.
-    - 'export PATH="${PERF_EVAL_VIEW:-/mnt/common/$USER/perf-eval-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
-    - 'command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer not on PATH (view: ${PERF_EVAL_VIEW:-/mnt/common/$USER/perf-eval-view})" >&2; exit 1; }'
-    - 'command -v jarvis    >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
-    - 'echo "toolchain: apptainer=$(command -v apptainer) jarvis=$(command -v jarvis)"'
+    # 2) The host launcher toolchain.
+    #
+    #    apptainer is NOT set up here. It is declared under config.host_pkgs
+    #    below, and jarvis provisions it itself: probe with `spack location -i`,
+    #    `spack install apptainer~suid` if absent, then fold what `spack load`
+    #    sets into its own process environment so every container subprocess it
+    #    spawns resolves the binary. That replaced a hand-built spack view and
+    #    its PERF_EVAL_VIEW override knob -- see the README.
+    #
+    #    Two things still need doing in the shell, because they happen before
+    #    jarvis is running:
+    #      a. jarvis itself, from its venv -- the generated sbatch script calls
+    #         bare `jarvis ppl run`. Override JARVIS_VENV before submitting.
+    #      b. apptainer for step 4's stale-instance reap, resolved straight out
+    #         of the spack install prefix (no view). Best-effort: on a first-ever
+    #         run apptainer is not installed yet and there is nothing stale to
+    #         reap, so an empty result is fine and step 4 guards on it.
+    #    Pure PATH assignment -- no `spack load` / `conda activate`, which are
+    #    shell functions that misbehave under `set -euo pipefail`.
+    - 'APPTAINER_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack location -i apptainer~suid 2>/dev/null || true )"'
+    - 'PATH="${APPTAINER_PREFIX:+$APPTAINER_PREFIX/bin:}${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'command -v jarvis >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - 'echo "toolchain: jarvis=$(command -v jarvis) spack_root=${SPACK_ROOT:-$HOME/spack} apptainer=$(command -v apptainer || echo "<not yet installed; host_pkgs will install it>")"'
     # 3) SIF gate: fail fast if the image was never staged.
     #    pre_cmds are verbatim shell, so resolve jarvis's shared_dir here.
     - 'JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)'
@@ -76,8 +91,9 @@ scheduler:
     # 4) stale-state cleanup: ghost daemons/instances from a crashed prior
     #    run wedge this one (port 9413, /dev/shm segments, leftover per-run
     #    /tmp). pkill patterns are BRACKETED so they never match this
-    #    script's own argv.
-    - 'timeout 30 apptainer instance stop --all >/dev/null 2>&1 || true'
+    #    script's own argv. The instance reap is guarded on apptainer
+    #    resolving in step 2b -- see the note there.
+    - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null 2>&1 || true'
     - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
     - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
     - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
@@ -98,6 +114,29 @@ config:
 
   # MUST stay literally identical to scheduler.hostfile above.
   hostfile: "${HOME}/.jarvis-perf-eval/single_node_hostfile.txt"
+
+  # ---- Host prerequisites ------------------------------------------------
+  # Tooling jarvis itself shells out to on the host baremetal, as opposed to
+  # `pkgs` below, which is the workload it deploys. jarvis probes each entry
+  # with `spack location -i`, runs `spack install <spec>` if it is missing,
+  # and folds the resulting `spack load` environment into its own process
+  # environment -- which is what the apptainer `instance start` / `build`
+  # calls need, since those run under a bare LocalExecInfo() and inherit an
+  # unmodified environment.
+  #
+  # `~suid` is NOT optional. The builtin recipe defaults to `+suid`, which
+  # builds a `starter-suid` that must be root-owned: unbuildable unprivileged,
+  # and fatal to the rootless `--fakeroot` path that container_fakeroot below
+  # depends on for the CTE and JuiceFS FUSE mounts.
+  #
+  # The install is a one-time cost on a fresh machine and streams its output
+  # to the job log; later runs find the spec already installed and skip it.
+  # It needs SPACK_ROOT exported into the job -- sbatch inherits the
+  # submitting environment by default, and a non-interactive job shell cannot
+  # see the `spack` shell function an rc file installs.
+  host_pkgs:
+    - install_method: spack
+      install_query: apptainer~suid
 
   # ---- Containerized deployment (Ares dev jarvis — APPTAINER) -----------
   base_deploy_mode: container
