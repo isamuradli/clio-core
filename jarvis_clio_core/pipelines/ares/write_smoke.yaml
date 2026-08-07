@@ -1,0 +1,138 @@
+# =============================================================================
+# WRITE SMOKE -- fast 4-point CTE-only check (issue #933).
+# =============================================================================
+#
+# Not a benchmark. It exists to answer one question in ~5 minutes instead of
+# the ~50 the full grid takes: is the small-I/O WRITE path fast enough yet?
+#
+# Everything not needed for that is gone -- no NFS, no redis, no JuiceFS, no
+# thread sweep. Just the CTE stack and ior at 4k and 1m, 1 and 8 ranks. 4k is
+# the point under test; 1m is the control that was already fast, so a
+# regression there separates 'small I/O still slow' from 'I broke writes'.
+#
+# Use the full single_node*.yaml sweeps for anything you intend to quote.
+
+scheduler:
+  name: slurm
+  job_name: perf_eval_write_smoke
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 32
+  partition: debug
+  time: 00:40:00
+  output: ${HOME}/write_smoke-%j.out
+  error: ${HOME}/write_smoke-%j.err
+  hostfile: ${HOME}/.jarvis-perf-eval/write_smoke_hostfile.txt
+  pre_cmds:
+  - if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group
+    $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi
+  - APPTAINER_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack
+    location -i apptainer~suid 2>/dev/null || true )"
+  - PATH="${APPTAINER_PREFIX:+$APPTAINER_PREFIX/bin:}${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"
+  - 'command -v jarvis >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})"
+    >&2; exit 1; }'
+  - 'echo "toolchain: jarvis=$(command -v jarvis) spack_root=${SPACK_ROOT:-$HOME/spack} apptainer=$(command
+    -v apptainer || echo "<not yet installed; host_pkgs will install it>")"'
+  - JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E
+    "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)
+  - "SIF=\"$JSD/containers/iowarp-perf-eval.sif\"; [ -n \"$JSD\" ] && [ -f \"$SIF\" ] || { echo \"ERROR:\
+    \ SIF missing: $SIF \u2014 build via jarvis-cd docker/build_perf_eval_image.sh\" >&2; exit 1; }"
+  - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null
+    2>&1 || true'
+  - pkill -9 -f "[c]himaera" 2>/dev/null || true
+  - pkill -9 -f "[c]lio_run" 2>/dev/null || true
+  - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+  - rm -f /dev/shm/chi_* 2>/dev/null || true
+  - find /tmp -maxdepth 1 \( -name "single_node*" -o -name "distributed*" \) -mmin +10 -exec rm -rf {}
+    + 2>/dev/null || true
+  - rm -rf /tmp/iowarp_chi* 2>/dev/null || true
+  - mkdir -p "$HOME/perf_eval_scratch/write_smoke/nfs" "$HOME/perf_eval_scratch/write_smoke/jfs_data"
+    "$HOME/write_smoke_results"
+  - jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true
+  - rm -f "$HOME/write_smoke_results/results.csv"
+  post_cmds:
+  - df -h /tmp | tail -1
+  - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null
+    2>&1 || true'
+  - rm -rf /tmp/single_node* /tmp/distributed* /tmp/iowarp_chi* /tmp/iowarp_prte_tmp 2>/dev/null || true
+  - rm -f /dev/shm/chi_* 2>/dev/null || true
+  - echo "reclaimed node-local /tmp:"; df -h /tmp | tail -1
+  - RES="$HOME/write_smoke_results/results.csv"; echo "--- results ---"; cut -d, -f4,6,8,20,26 "$RES"
+    2>/dev/null | column -s, -t || cat "$RES"
+config:
+  name: write_smoke
+  hostfile: ${HOME}/.jarvis-perf-eval/write_smoke_hostfile.txt
+  host_pkgs:
+  - install_method: spack
+    install_query: apptainer~suid
+  base_deploy_mode: container
+  container_engine: apptainer
+  container_image: iowarp-perf-eval
+  container_fakeroot: true
+  tmp_bind_root: /tmp
+  container_binds:
+  - ${HOME}/perf_eval_scratch:${HOME}/perf_eval_scratch
+  env:
+    CLIO_MEMFD_DIR: /tmp/iowarp_chimaera
+  pkgs:
+  - pkg_type: jarvis_clio_core.clio_runtime
+    pkg_name: runtime
+    num_threads: 4
+    port: 9413
+    ipc_mode: shm
+    log_level: info
+    sleep: 4
+    swim_enabled: false
+  - pkg_type: jarvis_clio_core.clio_cte
+    pkg_name: cte_core
+    devices:
+    - - ram::cte_ram_tier1
+      - 24GB
+      - 1.0
+    dpe_type: max_bw
+    neighborhood: 1
+    pool_query: local
+    default_target_timeout_ms: 30000
+    poll_period_ms: 5000
+  - pkg_type: jarvis_clio_core.clio_cte_libfuse
+    pkg_name: cte_fuse
+    mountpoint: /tmp/cte_mnt
+    log_level: info
+    extra_fuse_args: -f
+    attr_timeout: 1.0
+    entry_timeout: 1.0
+    negative_timeout: 1.0
+    writeback: false
+    max_write_kib: 1024
+    max_background: 64
+    max_readahead_kib: 1024
+    sleep: 2
+  - pkg_type: builtin.ior
+    pkg_name: cte_ior
+    api: posix
+    write: true
+    read: true
+    fpp: true
+    xfer: 4k
+    block: 64m
+    nprocs: 1
+    ppn: 1
+    stonewall: 120
+    out: /tmp/cte_mnt/ior_cte.bin
+vars:
+  cte_ior.xfer:
+  - 4k
+  - 1m
+  cte_ior.nprocs:
+  - 1
+  - 8
+  cte_ior.ppn:
+  - 1
+  - 8
+loop:
+- - cte_ior.xfer
+- - cte_ior.nprocs
+  - cte_ior.ppn
+run_timeout: 600
+repeat: 1
+output: ${HOME}/write_smoke_results
