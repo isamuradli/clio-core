@@ -164,6 +164,14 @@ CfsHandle *GetHandle(struct fuse_file_info *fi) {
 // and time both. Printed once at unmount. Zero cost when off.
 std::atomic<uint64_t> g_w_calls{0}, g_w_bytes{0}, g_w_ns{0};
 std::atomic<uint64_t> g_put_calls{0}, g_put_bytes{0}, g_put_ns{0};
+// Time spent OUTSIDE our handler, i.e. between the end of one write upcall and
+// the start of the next. With a single sequential writer that gap IS the
+// kernel<->daemon round trip minus our processing, which is the ~260 us that
+// every adapter-side fix has failed to touch. Splitting it out says whether the
+// daemon is slow to reply or the kernel is slow to deliver -- the two have
+// completely different fixes and nothing measured so far distinguishes them.
+std::atomic<uint64_t> g_gap_ns{0}, g_gap_n{0};
+std::atomic<uint64_t> g_last_end_ns{0};
 
 // How often to emit. MUST be below the upcall count of the smallest run being
 // measured or nothing is ever printed: a 64 MiB 4 KiB write phase is only
@@ -206,6 +214,14 @@ void ReportWriteStats() {
           (unsigned long)(pc ? pb / pc : 0),
           pc ? (double)pns / pc / 1000.0 : 0.0,
           ns ? 100.0 * (double)pns / (double)ns : 0.0);
+  const uint64_t gn = g_gap_n.load(), gns = g_gap_ns.load();
+  if (gn) {
+    fprintf(stderr,
+            "clio_cte_fuse GAP STATS: gaps=%lu avg_gap_us=%.1f "
+            "(time between upcalls = kernel round trip; ours is %.1f us)\n",
+            (unsigned long)gn, (double)gns / gn / 1000.0,
+            (double)ns / c / 1000.0);
+  }
 }
 
 bool CoalesceEnabled() {
@@ -966,9 +982,18 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
     return cte_fuse_write_inner(path, buf, size, offset, fi);
   }
   const auto t0 = std::chrono::steady_clock::now();
+  const uint64_t t0ns =
+      (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+          t0.time_since_epoch()).count();
+  const uint64_t prev = g_last_end_ns.exchange(0);
+  if (prev != 0 && t0ns > prev) { g_gap_ns += (t0ns - prev); g_gap_n++; }
   const int rc = cte_fuse_write_inner(path, buf, size, offset, fi);
   g_w_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - t0).count();
+  const auto tend = std::chrono::steady_clock::now();
+  g_last_end_ns.store((uint64_t)
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          tend.time_since_epoch()).count());
   const uint64_t n = ++g_w_calls;
   if (rc > 0) g_w_bytes += (uint64_t)rc;
   // Report PERIODICALLY, not only from cte_fuse_destroy. The deployment stops
