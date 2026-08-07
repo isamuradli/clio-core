@@ -165,6 +165,24 @@ CfsHandle *GetHandle(struct fuse_file_info *fi) {
 std::atomic<uint64_t> g_w_calls{0}, g_w_bytes{0}, g_w_ns{0};
 std::atomic<uint64_t> g_put_calls{0}, g_put_bytes{0}, g_put_ns{0};
 
+// How often to emit. MUST be below the upcall count of the smallest run being
+// measured or nothing is ever printed: a 64 MiB 4 KiB write phase is only
+// 16,384 upcalls, and the daemon restarts per combination so counters never
+// accumulate past one phase. A 20000 threshold therefore reported NOTHING for
+// exactly the case under investigation. Configurable so a threshold mistake
+// costs an env var rather than a 25-minute rebuild.
+uint64_t WriteStatsEvery() {
+  static const uint64_t v = [] {
+    if (const char *e = std::getenv("CLIO_CTE_FUSE_WRITE_STATS_EVERY")) {
+      char *end = nullptr;
+      unsigned long long n = std::strtoull(e, &end, 10);
+      if (end != e && n > 0) return (uint64_t)n;
+    }
+    return (uint64_t)2000;
+  }();
+  return v;
+}
+
 bool WriteStatsEnabled() {
   static const bool v = [] {
     const char *e = std::getenv("CLIO_CTE_FUSE_WRITE_STATS");
@@ -957,7 +975,7 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
   // this daemon with SIGKILL (jarvis Kill()), so destroy never runs and a
   // destroy-only report is silently lost -- which is exactly what happened on
   // the first instrumented run.
-  if (n % 20000 == 0) ReportWriteStats();
+  if (n % WriteStatsEvery() == 0) ReportWriteStats();
   return rc;
 }
 
