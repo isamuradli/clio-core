@@ -226,8 +226,14 @@ void ReportWriteStats() {
 
 bool CoalesceEnabled() {
   static const bool v = [] {
+    // DEFAULT OFF (issue #933). Routing writes through Client::Write's pooled
+    // staging regressed 8-rank concurrency to EIO -- ior fails with
+    // "write(...) failed, errno 5" -- while delivering no throughput benefit
+    // at any rank count. The raw AsyncWrite path below is the measured-good
+    // one: 50.4-58.2 MiB/s at 8-32 ranks, versus a hard failure. Opt in with
+    // CLIO_CTE_FUSE_COALESCE=1 once the pooled path is fixed.
     const char *e = std::getenv("CLIO_CTE_FUSE_COALESCE");
-    return e == nullptr || !(std::string(e) == "0" || std::string(e) == "false");
+    return e != nullptr && (std::string(e) == "1" || std::string(e) == "true");
   }();
   return v;
 }
@@ -962,14 +968,32 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
   // Buffered writes are not visible to the client yet (see CfsHandle), so a
   // read must push them out first -- including buffers held by OTHER handles
   // on this file, which is why the registry exists.
-  FlushPathBuffers(handle->path);
   auto *cfs = CLIO_CFS_CLIENT;
-  const ssize_t got = cfs->Read(handle->fh, handle->path,
-                                static_cast<clio::run::u64>(offset), buf, size);
-  if (got < 0) {
-    return -errno;
+  if (CoalesceEnabled()) {
+    // Only the buffering path can hide bytes from the client, and only then is
+    // Client::Read's in-flight-staging tier needed for read-your-own-writes.
+    FlushPathBuffers(handle->path);
+    const ssize_t got = cfs->Read(handle->fh, handle->path,
+                                  static_cast<clio::run::u64>(offset), buf,
+                                  size);
+    return (got < 0) ? -errno : static_cast<int>(got);
   }
-  return static_cast<int>(got);
+  auto *ipc = CLIO_IPC;
+  ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
+  if (shm_buf.IsNull()) return -ENOMEM;
+  auto t = cfs->AsyncRead(handle->fh, static_cast<clio::run::u64>(offset), size,
+                          ctp::ipc::ShmPtr<>(shm_buf.shm_));
+  t.Wait();
+  int rc;
+  if (t->GetReturnCode() == 0) {
+    const size_t got = static_cast<size_t>(t->bytes_read_);
+    if (got > 0) memcpy(buf, shm_buf.ptr_, got);
+    rc = static_cast<int>(got);
+  } else {
+    rc = -EIO;
+  }
+  ipc->FreeBuffer(shm_buf);
+  return rc;
 }
 
 static int cte_fuse_write_inner(const char *path, const char *buf, size_t size,
@@ -1094,12 +1118,24 @@ static int cte_fuse_write_inner(const char *path, const char *buf, size_t size,
     const int rc = FlushLocked(handle);
     if (rc != 0) return rc;
   }
-  const ssize_t written = cfs->Write(handle->fh, handle->path, off, buf,
-                                     size, sync);
-  if (written < 0) {
-    return -errno;
-  }
-  return static_cast<int>(written);
+  // Raw AsyncWrite, NOT Client::Write. This is the measured-good path: routing
+  // through Client::Write's pooled staging fails at 8 concurrent ranks with
+  // EIO, and buys nothing -- 4 KiB writes measured 14-17 MiB/s through it at
+  // 1 rank, indistinguishable from this path, because ~98% of a small write is
+  // the kernel round trip (5 us in this handler against a ~300 us gap between
+  // upcalls) rather than anything the submit path does.
+  auto *ipc = CLIO_IPC;
+  ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
+  if (shm_buf.IsNull()) return -ENOMEM;
+  memcpy(shm_buf.ptr_, buf, size);
+  auto t = cfs->AsyncWrite(handle->fh, off, size,
+                           ctp::ipc::ShmPtr<>(shm_buf.shm_));
+  t.Wait();
+  const int rc = (t->GetReturnCode() == 0)
+                     ? static_cast<int>(t->bytes_written_)
+                     : -EIO;
+  ipc->FreeBuffer(shm_buf);
+  return rc;
 }
 
 // ============================================================================
