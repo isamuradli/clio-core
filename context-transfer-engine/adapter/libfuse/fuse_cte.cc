@@ -245,8 +245,28 @@ void ReportWriteStats() {
 // on each RPC, and they are independent wins.
 bool DeferEnabled() {
   static const bool v = [] {
+    // DEFAULT OFF until the chimod can outlive the caller's buffer.
+    //
+    // Runtime::Write reads DIRECTLY out of the task payload -- "no staging
+    // buffer, no copy", by design (issue #830). Synchronously that is safe:
+    // AsyncWrite().Wait() keeps the caller's buffer alive for the whole read.
+    // Deferred it is not: the registry recycles staging through
+    // PoolFreeStaging as soon as the future reports complete, so a buffer can
+    // be handed to another write while the runtime is still reading it.
+    //
+    // Measured at 4 KiB with 2 ranks: 7,165 of ~32,768 deferred writes fail
+    // with rc=5 from the runtime (~22%), across exactly the two keys the two
+    // ranks write. One rank never fails, because nothing else can claim the
+    // recycled buffer. The failure reaches the caller as EIO at close(), which
+    // is correct reporting of real data loss.
+    //
+    // The performance case is strong -- the handler drops from 90us to 20.7us
+    // and 4 KiB/1-rank throughput rises 19.13 -> 25.9 MiB/s -- so this is worth
+    // fixing properly: either the chimod copies the payload before returning,
+    // or the registry holds staging until the runtime signals it is done with
+    // it rather than until the task completes.
     const char *e = std::getenv("CLIO_CTE_FUSE_DEFER");
-    return e == nullptr || !(std::string(e) == "0" || std::string(e) == "false");
+    return e != nullptr && (std::string(e) == "1" || std::string(e) == "true");
   }();
   return v;
 }

@@ -1318,6 +1318,17 @@ class Client : public clio::run::ContainerClient {
     if (t == nullptr || t->GetReturnCode() != 0) {
       reg.errors_.fetch_add(1);
       err = EIO;
+      // Both causes latch the same EIO, which makes them indistinguishable in
+      // the failure a caller finally sees at close(). Say which: a null future
+      // means the task was never submitted, a non-zero code means the runtime
+      // rejected it, and they have nothing in common as bugs.
+      HLOG(kError,
+           "[defer] deferred put failed: {} (ents={}, first_key={:#x})",
+           t == nullptr ? "NULL future (task never submitted)"
+                        : "runtime returned rc=" +
+                              std::to_string(t->GetReturnCode()),
+           entry.ents_.size(),
+           entry.ents_.empty() ? 0ull : entry.ents_[0].key_);
     }
     clio::run::u64 bytes = 0;
     for (const auto &e : entry.ents_) bytes += e.size_;
@@ -1396,6 +1407,13 @@ class Client : public clio::run::ContainerClient {
       if (t == nullptr || t->GetReturnCode() != 0) {
         reg.errors_.fetch_add(1);
         err = EIO;
+        HLOG(kError,
+             "[defer] deferred put failed (reap): {} (ents={}, first_key={:#x})",
+             t == nullptr ? "NULL future (task never submitted)"
+                          : "runtime returned rc=" +
+                                std::to_string(t->GetReturnCode()),
+             entry.ents_.size(),
+             entry.ents_.empty() ? 0ull : entry.ents_[0].key_);
       }
       clio::run::u64 bytes = 0;
       for (const auto &e : entry.ents_) bytes += e.size_;
