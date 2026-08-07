@@ -259,10 +259,14 @@ class ClioRuntime(Service):
             hostfile_path = self.hostfile.path if self.hostfile.path else ''
 
         config_dict = {
-            'memory': {
-                'main_segment_size': main_size,
-                'client_data_segment_size': client_size
-            },
+            # NOTE: there is no 'memory' section. ConfigManager::ParseYAML reads
+            # main_segment_size and client_data_segment_size out of 'runtime',
+            # and parses no 'memory' keys at all -- so emitting them under
+            # 'memory' (as this did) meant both knobs were silently ignored and
+            # the runtime always took its auto default: a main segment sized to
+            # the machine's RAM, then clamped to half the memory budget. On a
+            # 96 GB node that is a ~24 GB segment no matter what the pipeline
+            # asked for.
             'networking': {
                 'port': self.config['port'],
                 'hostfile': hostfile_path
@@ -272,6 +276,8 @@ class ClioRuntime(Service):
                 'file': f"{self.shared_dir}/clio_run.log"
             },
             'runtime': {
+                'main_segment_size': main_size,
+                'client_data_segment_size': client_size,
                 'num_threads': self.config['num_threads'],
                 'process_reaper_threads': self.config['process_reaper_workers'],
                 'queue_depth': self.config['queue_depth'],
