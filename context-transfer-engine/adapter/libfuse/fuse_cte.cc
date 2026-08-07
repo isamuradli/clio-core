@@ -41,6 +41,8 @@
 #include <cerrno>                 // errno
 #include <cstdio>                 // snprintf, fprintf
 #include <cstdlib>                // getenv, strtod, strtoul
+#include <map>                    // multimap (open-handle registry)
+#include <mutex>                  // mutex, lock_guard
 #include <fcntl.h>                // O_CREAT, O_RDWR
 #ifdef __linux__
 #include <linux/falloc.h>         // FALLOC_FL_* (fallocate mode flags)
@@ -104,13 +106,99 @@ using namespace clio::cae::fuse;
 
 namespace {
 /** Per-open-file state: the chimod handle + the path it was opened on. */
+// ---- write coalescing (issue #933) -----------------------------------------
+// The chimod's Write handler splits a write into kFsPageSize pages and awaits
+// one AsyncPutBlob per page, and the pages of one file are named by offset --
+// so a SEQUENTIAL 4 KiB write stream sends 256 separate puts to the SAME page,
+// i.e. the same blob, which serializes them on that blob's write token. The
+// runtime's own comment calls that token "the dominant clio-fs write-latency
+// tail". Measured: 4 KiB writes 17.2 MiB/s against 1 MiB writes 304.7 MiB/s on
+// the same mount, an 18x gap that is entirely per-blob contention rather than
+// bandwidth.
+//
+// Neither layer above could fix it. Client-side deferral pipelines 256 writes
+// deep, but they all queue on the one token, so it measured identical (17.2 vs
+// 17.7 blocking). Kernel writeback measured WORSE (13.9) -- it adds a page
+// cache without merging the upcalls.
+//
+// What does fix it is sending FEWER, BIGGER writes: accumulate contiguous
+// writes here and hand the chimod one put per page. This is the same shape as
+// JuiceFS's client buffer, and JuiceFS is the FUSE peer that outruns us 3x on
+// this exact workload.
+struct CfsHandle;
+
+// Every open handle, keyed by path, so an operation on a FILE can flush
+// buffers held by handles it does not own. Without this, buffered bytes would
+// be visible only through the descriptor that wrote them -- a second open of
+// the same file would read stale data, which is a POSIX violation rather than
+// a performance tradeoff. Guarded by a single mutex: open/release are rare
+// next to write, so this never contends on the hot path.
+std::mutex g_open_mu;
+std::multimap<std::string, CfsHandle *> g_open_by_path;
+
 struct CfsHandle {
   clio::run::u64 fh = 0;
   std::string path;
+
+  // Coalescing buffer. Holds [buf_off, buf_off+buf_len) of the file, always
+  // within ONE kFsPageSize page so a flush is exactly one put.
+  std::mutex mu;
+  std::vector<char> buf;
+  clio::run::u64 buf_off = 0;
+  size_t buf_len = 0;
 };
 
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
+}
+
+bool CoalesceEnabled() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_CTE_FUSE_COALESCE");
+    return e == nullptr || !(std::string(e) == "0" || std::string(e) == "false");
+  }();
+  return v;
+}
+
+// Submit whatever is buffered. Caller MUST hold h->mu.
+// Returns 0, or a negative errno.
+int FlushLocked(CfsHandle *h) {
+  if (h->buf_len == 0) {
+    return 0;
+  }
+  auto *cfs = CLIO_CFS_CLIENT;
+  const size_t len = h->buf_len;
+  const clio::run::u64 off = h->buf_off;
+  // Clear BEFORE submitting: on failure the bytes are gone from the buffer
+  // either way (the error is latched against the path and reported by
+  // flush/fsync/close), and leaving them would let a retry double-write.
+  h->buf_len = 0;
+  const ssize_t w = cfs->Write(h->fh, h->path, off, h->buf.data(), len, false);
+  return (w < 0) ? -errno : 0;
+}
+
+int FlushHandle(CfsHandle *h) {
+  std::lock_guard<std::mutex> lk(h->mu);
+  return FlushLocked(h);
+}
+
+// Flush every open handle on `path`. Used by the read and metadata paths,
+// which must observe bytes that are still sitting in some handle's buffer.
+int FlushPathBuffers(const std::string &path) {
+  std::vector<CfsHandle *> hs;
+  {
+    std::lock_guard<std::mutex> lk(g_open_mu);
+    auto range = g_open_by_path.equal_range(path);
+    for (auto it = range.first; it != range.second; ++it) {
+      hs.push_back(it->second);
+    }
+  }
+  int rc = 0;
+  for (CfsHandle *h : hs) {
+    const int r = FlushHandle(h);
+    if (rc == 0) rc = r;
+  }
+  return rc;
 }
 
 // ---- mount tuning read from the environment (issue #933) -------------------
@@ -361,6 +449,7 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
   // times and ownership too, so the authoritative read is still AsyncGetattr
   // below. What the call buys is the ordering — by the time it returns, any
   // write that could have grown the file has landed.
+  FlushPathBuffers(p);
   bool exists = false;
   clio::run::u64 pending_size = 0;
   (void)cfs->GetAttr(p, &exists, &pending_size);
@@ -660,6 +749,10 @@ static int cte_fuse_create(const char *path, cte_mode_t mode,
   auto *handle = new CfsHandle();
   handle->fh = t->handle_;
   handle->path = p;
+  {
+    std::lock_guard<std::mutex> lk(g_open_mu);
+    g_open_by_path.emplace(handle->path, handle);
+  }
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
   return 0;
@@ -678,6 +771,10 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   auto *handle = new CfsHandle();
   handle->fh = t->handle_;
   handle->path = p;
+  {
+    std::lock_guard<std::mutex> lk(g_open_mu);
+    g_open_by_path.emplace(handle->path, handle);
+  }
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
   return 0;
@@ -698,8 +795,13 @@ static int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   const std::string p = handle ? handle->path : std::string(path ? path : "");
   if (p.empty()) return 0;
+  // Buffer first, then the deferred queue: a buffered write is not yet even
+  // submitted, so draining the queue without it would report success for data
+  // that has not been sent.
+  const int brc = FlushPathBuffers(p);
   auto *cfs = CLIO_CFS_CLIENT;
-  return cfs->Flush(p) == 0 ? 0 : -errno;
+  const int frc = cfs->Flush(p) == 0 ? 0 : -errno;
+  return brc != 0 ? brc : frc;
 }
 
 // datasync is ignored deliberately: the deferred queue holds data writes, and
@@ -710,8 +812,13 @@ static int cte_fuse_fsync(const char *path, int /*datasync*/,
   auto *handle = GetHandle(fi);
   const std::string p = handle ? handle->path : std::string(path ? path : "");
   if (p.empty()) return 0;
+  // Buffer first, then the deferred queue: a buffered write is not yet even
+  // submitted, so draining the queue without it would report success for data
+  // that has not been sent.
+  const int brc = FlushPathBuffers(p);
   auto *cfs = CLIO_CFS_CLIENT;
-  return cfs->Flush(p) == 0 ? 0 : -errno;
+  const int frc = cfs->Flush(p) == 0 ? 0 : -errno;
+  return brc != 0 ? brc : frc;
 }
 
 static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
@@ -724,7 +831,15 @@ static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
   // handle torn down without one), so closing a handle whose writes are still
   // queued would strand them against a dead fh. Take the error too -- this is
   // the last chance to report a write that failed after being acked.
-  int rc = (cfs->Flush(handle->path) == 0) ? 0 : -errno;
+  int rc = FlushHandle(handle);
+  {
+    std::lock_guard<std::mutex> lk(g_open_mu);
+    auto range = g_open_by_path.equal_range(handle->path);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second == handle) { g_open_by_path.erase(it); break; }
+    }
+  }
+  if (rc == 0) rc = (cfs->Flush(handle->path) == 0) ? 0 : -errno;
   auto t = cfs->AsyncClose(handle->fh);
   t.Wait();
   if (rc == 0 && t->GetReturnCode() != 0) {
@@ -763,6 +878,10 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
   //     come from the shared-memory mirror (no IPC), and only what neither
   //     covers costs an RPC. The old path paid an SHM allocation and a full
   //     round trip unconditionally.
+  // Buffered writes are not visible to the client yet (see CfsHandle), so a
+  // read must push them out first -- including buffers held by OTHER handles
+  // on this file, which is why the registry exists.
+  FlushPathBuffers(handle->path);
   auto *cfs = CLIO_CFS_CLIENT;
   const ssize_t got = cfs->Read(handle->fh, handle->path,
                                 static_cast<clio::run::u64>(offset), buf, size);
@@ -803,8 +922,66 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
   // only while every write blocked; they are real now.
   const bool sync = (fi->flags & (O_SYNC | O_DSYNC)) != 0;
   auto *cfs = CLIO_CFS_CLIENT;
-  const ssize_t written = cfs->Write(handle->fh, handle->path,
-                                     static_cast<clio::run::u64>(offset), buf,
+  const clio::run::u64 off = static_cast<clio::run::u64>(offset);
+  const clio::run::u64 kPage = clio::cte::filesystem::kFsPageSize;
+
+  // Coalesce contiguous writes into whole pages before submitting (see the
+  // note on CfsHandle). O_SYNC skips it: that caller asked for durability over
+  // latency, and buffering is the opposite of that. A write already >= a page
+  // skips it too -- it is a whole put by itself and buffering would add a copy
+  // for nothing.
+  if (CoalesceEnabled() && !sync && size < kPage) {
+    std::lock_guard<std::mutex> lk(handle->mu);
+    // Not contiguous with what is buffered? The buffer describes one extent,
+    // so the old one has to go out before this one can start.
+    if (handle->buf_len != 0 &&
+        off != handle->buf_off + handle->buf_len) {
+      const int rc = FlushLocked(handle);
+      if (rc != 0) return rc;
+    }
+    if (handle->buf_len == 0) {
+      handle->buf_off = off;
+    }
+    // Never let the buffer straddle a page: the chimod would split it into two
+    // puts and we would be back to multiple writes hitting one blob, which is
+    // the entire problem.
+    const clio::run::u64 page_end =
+        (handle->buf_off / kPage + 1) * kPage;
+    const size_t room =
+        static_cast<size_t>(page_end - (handle->buf_off + handle->buf_len));
+    const size_t take = std::min(size, room);
+    if (handle->buf.size() < static_cast<size_t>(kPage)) {
+      handle->buf.resize(static_cast<size_t>(kPage));
+    }
+    memcpy(handle->buf.data() + handle->buf_len, buf, take);
+    handle->buf_len += take;
+    if (handle->buf_off + handle->buf_len >= page_end) {
+      const int rc = FlushLocked(handle);
+      if (rc != 0) return rc;
+    }
+    // The remainder starts the next page; recurse once through the same path.
+    if (take < size) {
+      handle->buf_off = off + take;
+      const size_t rest = size - take;
+      if (handle->buf.size() < static_cast<size_t>(kPage)) {
+        handle->buf.resize(static_cast<size_t>(kPage));
+      }
+      memcpy(handle->buf.data(), buf + take, rest);
+      handle->buf_len = rest;
+    }
+    // Buffered writes ALWAYS report success, exactly as deferred ones do: a
+    // failure is latched against the path and reported by flush/fsync/close.
+    return static_cast<int>(size);
+  }
+
+  // Uncoalesced path: flush anything buffered first so this write cannot
+  // overtake bytes written before it.
+  {
+    std::lock_guard<std::mutex> lk(handle->mu);
+    const int rc = FlushLocked(handle);
+    if (rc != 0) return rc;
+  }
+  const ssize_t written = cfs->Write(handle->fh, handle->path, off, buf,
                                      size, sync);
   if (written < 0) {
     return -errno;
@@ -823,6 +1000,7 @@ static int cte_fuse_unlink(const char *path) {
   // to a tag that no longer exists, and its latched error would then surface
   // against a path the caller has already deleted. Also keeps the deferred
   // registry from holding entries keyed to a dead file.
+  FlushPathBuffers(p);
   (void)cfs->Flush(p);
   auto t = cfs->AsyncUnlink(p);
   t.Wait();
@@ -841,6 +1019,7 @@ static int cte_fuse_truncate(const char *path, cte_off_t size,
   // Unlike stat, there is no cheap partial answer here -- the whole point is
   // that nothing may be in flight when the length changes -- so this drains
   // unconditionally. ftruncate is rare next to write(2); correctness wins.
+  FlushPathBuffers(p);
   (void)cfs->Flush(p);
   auto t = cfs->AsyncTruncate(p, static_cast<clio::run::u64>(size));
   t.Wait();
@@ -1097,6 +1276,8 @@ static int cte_fuse_rename(const char *from, const char *to,
   // find it, because its key is the old path. That is silent data loss, not a
   // stale read. Draining `to` as well covers the overwrite case, where the
   // destination has its own writes in flight that must not outlive it.
+  FlushPathBuffers(std::string(from));
+  FlushPathBuffers(std::string(to));
   (void)cfs->Flush(std::string(from));
   (void)cfs->Flush(std::string(to));
   auto t = cfs->AsyncRename(std::string(from), std::string(to));
