@@ -951,8 +951,13 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
   const int rc = cte_fuse_write_inner(path, buf, size, offset, fi);
   g_w_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - t0).count();
-  g_w_calls++;
+  const uint64_t n = ++g_w_calls;
   if (rc > 0) g_w_bytes += (uint64_t)rc;
+  // Report PERIODICALLY, not only from cte_fuse_destroy. The deployment stops
+  // this daemon with SIGKILL (jarvis Kill()), so destroy never runs and a
+  // destroy-only report is silently lost -- which is exactly what happened on
+  // the first instrumented run.
+  if (n % 20000 == 0) ReportWriteStats();
   return rc;
 }
 
