@@ -529,7 +529,19 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
                                    kFsPreallocBytes),
                                /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
-    if (p->GetReturnCode() != 0) { ok = false; break; }
+    if (p->GetReturnCode() != 0) {
+      // Report the PUT's own code. The write task collapses every failure to
+      // EIO, so without this the caller cannot tell a full target from a bad
+      // pointer from a rejected task -- and the caller is what finally reports
+      // it, at close(), long after the context is gone.
+      HLOG(kError,
+           "[fs-write] PutBlob failed rc={} page={} page_off={} len={} "
+           "off={} size={}",
+           p->GetReturnCode(), PageName(cur), page_off, to_write,
+           task->offset_, task->size_);
+      ok = false;
+      break;
+    }
     done += to_write;
     cur += to_write;
   }
