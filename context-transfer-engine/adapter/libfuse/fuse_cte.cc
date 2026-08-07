@@ -43,6 +43,8 @@
 #include <cstdlib>                // getenv, strtod, strtoul
 #include <map>                    // multimap (open-handle registry)
 #include <mutex>                  // mutex, lock_guard
+#include <atomic>                 // atomic (write-path counters)
+#include <chrono>                 // steady_clock (write-path timing)
 #include <fcntl.h>                // O_CREAT, O_RDWR
 #ifdef __linux__
 #include <linux/falloc.h>         // FALLOC_FL_* (fallocate mode flags)
@@ -152,6 +154,42 @@ CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
 }
 
+// ---- write-path instrumentation (issue #933) -------------------------------
+// Four separate fixes -- client-side deferral, kernel writeback, page
+// coalescing -- each targeted a different layer and none moved 4 KiB writes off
+// ~15 MiB/s. That is ~4,400 write upcalls/s, i.e. ~227 us each, against 10-20 us
+// for an ordinary FUSE upcall; meanwhile 1 MiB writes are bandwidth-limited,
+// not overhead-limited. Guessing which layer owns those 227 us has now been
+// wrong twice, so measure it: count upcalls, count the puts actually submitted,
+// and time both. Printed once at unmount. Zero cost when off.
+std::atomic<uint64_t> g_w_calls{0}, g_w_bytes{0}, g_w_ns{0};
+std::atomic<uint64_t> g_put_calls{0}, g_put_bytes{0}, g_put_ns{0};
+
+bool WriteStatsEnabled() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_CTE_FUSE_WRITE_STATS");
+    return e != nullptr && std::string(e) != "0";
+  }();
+  return v;
+}
+
+void ReportWriteStats() {
+  if (!WriteStatsEnabled()) return;
+  const uint64_t c = g_w_calls.load(), b = g_w_bytes.load(), ns = g_w_ns.load();
+  const uint64_t pc = g_put_calls.load(), pb = g_put_bytes.load(),
+                 pns = g_put_ns.load();
+  if (c == 0) return;
+  fprintf(stderr,
+          "clio_cte_fuse WRITE STATS: upcalls=%lu bytes=%lu avg_size=%lu "
+          "avg_upcall_us=%.1f | puts=%lu put_bytes=%lu avg_put_size=%lu "
+          "avg_put_us=%.1f | put_share_of_upcall=%.0f%%\n",
+          (unsigned long)c, (unsigned long)b, (unsigned long)(b / c),
+          (double)ns / c / 1000.0, (unsigned long)pc, (unsigned long)pb,
+          (unsigned long)(pc ? pb / pc : 0),
+          pc ? (double)pns / pc / 1000.0 : 0.0,
+          ns ? 100.0 * (double)pns / (double)ns : 0.0);
+}
+
 bool CoalesceEnabled() {
   static const bool v = [] {
     const char *e = std::getenv("CLIO_CTE_FUSE_COALESCE");
@@ -173,7 +211,15 @@ int FlushLocked(CfsHandle *h) {
   // either way (the error is latched against the path and reported by
   // flush/fsync/close), and leaving them would let a retry double-write.
   h->buf_len = 0;
+  const bool st = WriteStatsEnabled();
+  const auto t0 = st ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
   const ssize_t w = cfs->Write(h->fh, h->path, off, h->buf.data(), len, false);
+  if (st) {
+    g_put_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    g_put_calls++; g_put_bytes += len;
+  }
   return (w < 0) ? -errno : 0;
 }
 
@@ -382,6 +428,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
 
 static void cte_fuse_destroy(void *private_data) {
   (void)private_data;
+  ReportWriteStats();
   clio::run::CLIO_RUNTIME_FINALIZE();
 }
 
@@ -891,8 +938,26 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
   return static_cast<int>(got);
 }
 
+static int cte_fuse_write_inner(const char *path, const char *buf, size_t size,
+                                cte_off_t offset, struct fuse_file_info *fi);
+
+// Thin timing wrapper so the measured span is exactly what FUSE hands us.
 static int cte_fuse_write(const char *path, const char *buf, size_t size,
                           cte_off_t offset, struct fuse_file_info *fi) {
+  if (!WriteStatsEnabled()) {
+    return cte_fuse_write_inner(path, buf, size, offset, fi);
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc = cte_fuse_write_inner(path, buf, size, offset, fi);
+  g_w_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  g_w_calls++;
+  if (rc > 0) g_w_bytes += (uint64_t)rc;
+  return rc;
+}
+
+static int cte_fuse_write_inner(const char *path, const char *buf, size_t size,
+                                cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
   if (!handle) return -EBADF;
