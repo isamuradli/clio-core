@@ -662,19 +662,35 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   return 0;
 }
 
-// Writes go straight through to the chimod (each AsyncWrite is awaited), so
-// there is nothing to drain on flush/fsync — they are durability no-ops.
+// Writes are DEFERRED (issue #933): cte_fuse_write submits and returns without
+// waiting, so these are the points where outstanding writes are made durable
+// and where a failed write is finally reported. They were `return 0` no-ops,
+// which was correct only while every write blocked. Leaving them that way once
+// writes went async would mean close(2) could return before the data existed,
+// and fsync(2) would be a lie.
+//
+// Client::Flush waits for every deferred write to `path` and takes the errno
+// they latched, reporting it ONCE -- the same discipline as the kernel page
+// cache, where a writeback failure surfaces at fsync rather than at some
+// unrelated later write(2).
 static int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
-  (void)path;
-  (void)fi;
-  return 0;
+  auto *handle = GetHandle(fi);
+  const std::string p = handle ? handle->path : std::string(path ? path : "");
+  if (p.empty()) return 0;
+  auto *cfs = CLIO_CFS_CLIENT;
+  return cfs->Flush(p) == 0 ? 0 : -errno;
 }
 
+// datasync is ignored deliberately: the deferred queue holds data writes, and
+// this filesystem has no separately-deferred metadata to skip, so the
+// datasync-only case has nothing cheaper to do than the full drain.
 static int cte_fuse_fsync(const char *path, int /*datasync*/,
                           struct fuse_file_info *fi) {
-  (void)path;
-  (void)fi;
-  return 0;
+  auto *handle = GetHandle(fi);
+  const std::string p = handle ? handle->path : std::string(path ? path : "");
+  if (p.empty()) return 0;
+  auto *cfs = CLIO_CFS_CLIENT;
+  return cfs->Flush(p) == 0 ? 0 : -errno;
 }
 
 static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
@@ -682,9 +698,17 @@ static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   if (!handle) return 0;
   auto *cfs = CLIO_CFS_CLIENT;
+  // Drain THIS file's deferred writes before closing its handle. The kernel
+  // issues flush before release, but not on every path (and never for a
+  // handle torn down without one), so closing a handle whose writes are still
+  // queued would strand them against a dead fh. Take the error too -- this is
+  // the last chance to report a write that failed after being acked.
+  int rc = (cfs->Flush(handle->path) == 0) ? 0 : -errno;
   auto t = cfs->AsyncClose(handle->fh);
   t.Wait();
-  int rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
+  if (rc == 0 && t->GetReturnCode() != 0) {
+    rc = -EIO;
+  }
   delete handle;
   fi->fh = 0;
   return rc;
@@ -704,25 +728,27 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
 
-  auto *ipc = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
-  if (shm_buf.IsNull()) return -ENOMEM;
-  ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
-
+  // Client::Read, not a hand-rolled AsyncRead().Wait() (issue #933). Two
+  // reasons, and the first is correctness rather than speed:
+  //
+  //  1. Now that writes are deferred, the authoritative bytes for a just
+  //     written region may still be sitting in a pending write's staging
+  //     buffer. Client::Read checks that first (DeferTryServe), so a read
+  //     after a write sees the value written. Going straight to the chimod, as
+  //     this did, would read the PRE-WRITE bytes -- silent corruption, not a
+  //     slow path.
+  //  2. It is also strictly cheaper: three tiers, cheapest first -- bytes in
+  //     flight are copied out of staging (no wait, no IPC), committed bytes
+  //     come from the shared-memory mirror (no IPC), and only what neither
+  //     covers costs an RPC. The old path paid an SHM allocation and a full
+  //     round trip unconditionally.
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncRead(handle->fh, static_cast<clio::run::u64>(offset), size,
-                          shm_ptr);
-  t.Wait();
-  int rc;
-  if (t->GetReturnCode() == 0) {
-    size_t got = static_cast<size_t>(t->bytes_read_);
-    if (got > 0) memcpy(buf, shm_buf.ptr_, got);
-    rc = static_cast<int>(got);
-  } else {
-    rc = -EIO;
+  const ssize_t got = cfs->Read(handle->fh, handle->path,
+                                static_cast<clio::run::u64>(offset), buf, size);
+  if (got < 0) {
+    return -errno;
   }
-  ipc->FreeBuffer(shm_buf);
-  return rc;
+  return static_cast<int>(got);
 }
 
 static int cte_fuse_write(const char *path, const char *buf, size_t size,
@@ -735,24 +761,34 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
 
-  auto *ipc = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
-  if (shm_buf.IsNull()) return -ENOMEM;
-  memcpy(shm_buf.ptr_, buf, size);
-  ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
-
+  // Client::Write, not a hand-rolled AsyncWrite().Wait() (issue #933). The
+  // client owns the deferred-write pipeline and this adapter was bypassing all
+  // of it: it allocated a fresh SHM buffer per write, copied, then BLOCKED on
+  // the round trip. Every small write therefore cost an allocator walk plus a
+  // full chimod round trip, serialized -- which is the entire small-I/O write
+  // deficit. Client::Write instead stages through the recycled pool (issue
+  // #892 measured cold allocation as THE submit bottleneck), submits, and
+  // returns without waiting; flow control is real shared-memory capacity
+  // rather than one-at-a-time.
+  //
+  // `sync` honours O_SYNC/O_DSYNC: that caller asked for durability over
+  // latency, and Client::Write blocks for exactly those.
+  //
+  // A deferred write ALWAYS reports success here. A queued write that later
+  // fails latches its errno against the path, and cte_fuse_flush/cte_fuse_fsync
+  // report it -- the same discipline the kernel page cache uses, where
+  // writeback errors surface at fsync rather than at an unrelated later
+  // write(2). Those two callbacks were `return 0` no-ops, which was harmless
+  // only while every write blocked; they are real now.
+  const bool sync = (fi->flags & (O_SYNC | O_DSYNC)) != 0;
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncWrite(handle->fh, static_cast<clio::run::u64>(offset), size,
-                           shm_ptr);
-  t.Wait();
-  int rc;
-  if (t->GetReturnCode() == 0) {
-    rc = static_cast<int>(t->bytes_written_);
-  } else {
-    rc = -EIO;
+  const ssize_t written = cfs->Write(handle->fh, handle->path,
+                                     static_cast<clio::run::u64>(offset), buf,
+                                     size, sync);
+  if (written < 0) {
+    return -errno;
   }
-  ipc->FreeBuffer(shm_buf);
-  return rc;
+  return static_cast<int>(written);
 }
 
 // ============================================================================
