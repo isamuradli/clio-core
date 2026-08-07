@@ -2388,7 +2388,14 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   // Get lane 0 (single lane) with the specified priority
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
-  bool was_empty = lane.Empty();
+  // Recorded for the trace below only. It MUST NOT gate the wake: Empty() and
+  // Push() are not atomic together, so a worker that is draining the lane can
+  // still be running when a producer samples Empty()==false, and then park
+  // before it observes this push. The task is stranded until something else
+  // happens to wake that worker -- a lost wakeup, and one that needs multiple
+  // producers to hit, which is why it shows up under concurrency and not on a
+  // single writer.
+  const bool was_empty = lane.Empty();
   lane.Push(future);
 
   // Pick the worker that drains this priority's queue. Cross-node Send
@@ -2396,7 +2403,7 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   // by net_send_worker; client response priorities (kClientSendTcp /
   // kClientSendIpc) are owned by net_recv_worker (the ROUTER socket is
   // shared with ClientRecv).
-  if (was_empty) {
+  {
     TaskLane *wake_lane = nullptr;
     switch (priority) {
       case NetQueuePriority::kSendInLatency:
@@ -2422,9 +2429,6 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx, was_empty, wake_lane != nullptr,
          wake_lane ? wake_lane->GetTid() : -1, net_send_lane_ != nullptr,
          net_recv_lane_ != nullptr, net_lane_ != nullptr);
-  } else {
-    HLOG(kDebug, "[TRACE768] t={} EnqueueNetTask prio={} was_empty=FALSE (no wake)",
-         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx);
   }
 
   HLOG(kDebug,
