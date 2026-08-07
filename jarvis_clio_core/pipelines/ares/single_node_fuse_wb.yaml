@@ -1,6 +1,28 @@
 # =============================================================================
-# Issue #526 — single-node performance evaluation sweep (containerized).
+# Single-node perf sweep — FUSE SMALL-I/O TUNING (issue #933).
 # =============================================================================
+#
+# single_node.yaml with the CTE FUSE adapter's new cache/upcall knobs turned
+# on, and nothing else changed. It exists to answer one question: is CTE's
+# small-I/O deficit amortization, or something deeper?
+#
+# The measurement that prompted it (4 KiB, 1 rank, same node):
+#
+#     CTE      15.0 MiB/s  =   3,840 ops/s
+#     JuiceFS 540.3 MiB/s  = 138,300 ops/s     (36x)
+#     NFS     338.5 MiB/s
+#
+# JuiceFS is ALSO FUSE, on the same kernel, and cannot be sustaining 138k
+# single-threaded upcalls per second -- so it is not doing one upcall per
+# 4 KiB. It ships attr/entry caches of 1.0s and a 300 MiB client buffer; the
+# kernel absorbs most operations and hands userspace far fewer, larger ones.
+# CTE's adapter shipped attr_timeout=entry_timeout=0 and write-through, so
+# nothing amortized. At 1 MiB the two invert (CTE 794.8 vs JuiceFS 389.8 on
+# write), which is what rules out bandwidth and the CTE data path.
+#
+# A server-side cache cannot fix this -- the interposer chain measured free
+# for exactly that reason: pool 563.0 sits on the far side of the upcall being
+# counted.
 #
 # Benchmarks four storage stacks back-to-back over one shared
 # (I/O size x thread count) grid and records every run into a single
@@ -23,7 +45,7 @@
 # Usage:
 #   # Stage the SIF; re-run daily so the sweep tracks the latest IOWarp.
 #   bash <jarvis-cd>/docker/build_perf_eval_image.sh
-#   jarvis ppl submit <abs path>/single_node.yaml
+#   jarvis ppl submit <abs path>/single_node_fuse_wb.yaml
 #
 #   Needs jarvis-cd @ dev for container_fakeroot, run_timeout, builtin.ior's
 #   container path, builtin.juicefs, host_pkgs, and jarvis_cd.util.container_utils
@@ -34,14 +56,14 @@
 #   (this checkout, default $HOME/clio-core), SPACK_ROOT (default $HOME/spack).
 #
 # Output:
-#   ${HOME}/single_node_results/results.csv — 24 rows. Per-driver columns:
+#   ${HOME}/single_node_fuse_wb_results/results.csv — 24 rows. Per-driver columns:
 #   <ior pkg>.write_max_mibs / .read_max_mibs / .runtime, and
 #   redis_bench.set_rps / .get_rps / .set_p50_ms / .get_p99_ms / .runtime
 #   (redis-benchmark's raw CSV lands in the pipeline shared_dir).
 
 scheduler:
   name: slurm
-  job_name: perf_eval_single_node
+  job_name: perf_eval_single_node_fuse_wb
   nodes: 1
   ntasks_per_node: 1
   # cpus_per_task must stay large: Ares Slurm uses proctrack/cgroup with
@@ -50,12 +72,12 @@ scheduler:
   cpus_per_task: 32
   partition: debug
   time: "12:00:00"
-  output: ${HOME}/single_node-%j.out
-  error: ${HOME}/single_node-%j.err
+  output: ${HOME}/single_node_fuse_wb-%j.out
+  error: ${HOME}/single_node_fuse_wb-%j.err
   # Uncomment to steer clear of nodes with a broken fakeroot uidmap.
   # exclude: "ares-comp-15,ares-comp-17"
   # MUST stay literally identical to config.hostfile below.
-  hostfile: "${HOME}/.jarvis-perf-eval/single_node_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-perf-eval/single_node_fuse_wb_hostfile.txt"
   pre_cmds:
     # 1) fakeroot GID fix: Slurm hands the job the project primary GID;
     #    rootless --fakeroot validates the GID map against group == $USER.
@@ -103,9 +125,9 @@ scheduler:
     # 5) experiment dirs + repo registration + clean-slate results (the
     #    sweep runner resumes over an existing results.csv and would skip
     #    previously-failed rows)
-    - 'mkdir -p "$HOME/perf_eval_scratch/single_node/nfs" "$HOME/perf_eval_scratch/single_node/jfs_data" "$HOME/single_node_results"'
+    - 'mkdir -p "$HOME/perf_eval_scratch/single_node_fuse_wb/nfs" "$HOME/perf_eval_scratch/single_node_fuse_wb/jfs_data" "$HOME/single_node_fuse_wb_results"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
-    - 'rm -f "$HOME/single_node_results/results.csv"'
+    - 'rm -f "$HOME/single_node_fuse_wb_results/results.csv"'
   post_cmds:
     # Reclaim node-local /tmp NOW rather than leaving it for the next
     # job's pre_cmd. That cleanup is guarded by -mmin +10, so a job
@@ -121,13 +143,13 @@ scheduler:
     - 'rm -rf /tmp/single_node* /tmp/distributed* /tmp/iowarp_chi* /tmp/iowarp_prte_tmp 2>/dev/null || true'
     - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
     - 'echo "reclaimed node-local /tmp:"; df -h /tmp | tail -1'
-    - 'RES="$HOME/single_node_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 24"; [ "$n" -ge 24 ] && echo "ALL 24 GREEN" || echo "INCOMPLETE — inspect $RES and the .err log"'
+    - 'RES="$HOME/single_node_fuse_wb_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 24"; [ "$n" -ge 24 ] && echo "ALL 24 GREEN" || echo "INCOMPLETE — inspect $RES and the .err log"'
 
 config:
-  name: single_node
+  name: single_node_fuse_wb
 
   # MUST stay literally identical to scheduler.hostfile above.
-  hostfile: "${HOME}/.jarvis-perf-eval/single_node_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-perf-eval/single_node_fuse_wb_hostfile.txt"
 
   # ---- Host prerequisites ------------------------------------------------
   # Tooling jarvis itself shells out to on the host baremetal, as opposed to
@@ -169,7 +191,7 @@ config:
   # Redirect in-container /tmp to NODE-LOCAL disk. Default jarvis backs
   # apptainer /tmp with an NFS overlay, which breaks chimaera's IPC unix
   # sockets and would put the JuiceFS cache on NFS. tmp_bind_root makes jarvis
-  # bind <root>/single_node/tmp -> /tmp from local disk instead.
+  # bind <root>/single_node_fuse_wb/tmp -> /tmp from local disk instead.
   tmp_bind_root: "/tmp"
   # Bind a shared-FS scratch dir into the instance. Applied at `apptainer
   # instance start` (the same mechanism as tmp_bind_root), so unlike a
@@ -230,6 +252,39 @@ config:
       mountpoint: /tmp/cte_mnt
       log_level: "info"
       extra_fuse_args: "-f"
+      # ---- THE difference from single_node.yaml (issue #933) -------------
+      # Deliberately matched to JuiceFS's shipped defaults, because JuiceFS
+      # is the control: also FUSE, same kernel, same node, and 36x faster on
+      # 4 KiB reads with no tuning at all. If these values close the gap, the
+      # deficit was amortization; if they do not, it is somewhere else and
+      # this pipeline says so.
+      #
+      #   JuiceFS default   attr-cache 1.0s  entry-cache 1.0s
+      #                     dir-entry-cache 1.0s  buffer-size 300M
+      #                     writeback FALSE
+      #
+      # This arm is that separate writeback arm. Caching alone (see
+      # single_node_fuse_tuned.yaml) fixed READS -- 4 KiB went 13.8 -> 473.6
+      # MiB/s, 34x, and past NFS -- but left WRITES flat at 1.0-1.1x, because
+      # attr/entry caching removes metadata upcalls while every write() is
+      # still a synchronous upcall of its own. Writeback is the only knob that
+      # changes that.
+      #
+      # It is isolated in its own pipeline because it is the one option with a
+      # SEMANTIC cost: the kernel takes ownership of file size and pads partial
+      # pages, so a reader can observe the kernel's size rather than the
+      # chimod's. Keeping it separate means the read win above can ship without
+      # buying this, and the write delta is attributable to this alone.
+      attr_timeout: 1.0
+      entry_timeout: 1.0
+      negative_timeout: 1.0
+      writeback: true
+      # 1 MiB upcalls and a deeper async queue: with caching on, the kernel
+      # has something to batch, and these set how much may travel per upcall
+      # and how many may be outstanding.
+      max_write_kib: 1024
+      max_background: 64
+      max_readahead_kib: 1024
       sleep: 2
 
     # JuiceFS: format (storage=file) + FUSE mount. Object store on the bound
@@ -239,7 +294,7 @@ config:
       pkg_name: juicefs
       meta_url: "redis://127.0.0.1:6379/1"
       storage: file
-      data_dir: ${HOME}/perf_eval_scratch/single_node/jfs_data
+      data_dir: ${HOME}/perf_eval_scratch/single_node_fuse_wb/jfs_data
       mountpoint: /tmp/jfs_mnt
       cache_dir: /tmp/juicefs_cache
       name: jfsbench
@@ -270,7 +325,7 @@ config:
       nprocs: 1
       ppn: 1
       stonewall: 120
-      out: ${HOME}/perf_eval_scratch/single_node/nfs/ior_nfs.bin
+      out: ${HOME}/perf_eval_scratch/single_node_fuse_wb/nfs/ior_nfs.bin
 
     # 2) CTE + libfuse: ior through the CTE FUSE mount.
     - pkg_type: builtin.ior
@@ -354,4 +409,4 @@ loop:
 run_timeout: 1200
 
 repeat: 1                       # bump to 3 for variance (~3x wall-clock)
-output: "${HOME}/single_node_results"
+output: "${HOME}/single_node_fuse_wb_results"

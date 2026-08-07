@@ -83,7 +83,7 @@ scheduler:
         pkill -9 -f "[c]lio_run" 2>/dev/null || true
         { command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true
         rm -f /dev/shm/chi_* 2>/dev/null || true
-        find /tmp -maxdepth 1 \( -name "distributed_run*" -o -name "distributed" \) -mmin +10 -exec rm -rf {} + 2>/dev/null || true
+        find /tmp -maxdepth 1 \( -name "single_node*" -o -name "distributed*" \) -mmin +10 -exec rm -rf {} + 2>/dev/null || true
         rm -rf /tmp/iowarp_chi* 2>/dev/null || true
         echo "prep done: $(hostname)"
       ' || echo "WARNING: per-node prep rc=$? — continuing"
@@ -123,6 +123,20 @@ scheduler:
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
     - 'rm -f "$HOME/distributed_results/results.csv"'
   post_cmds:
+    # Reclaim node-local /tmp NOW rather than leaving it for the next
+    # job's pre_cmd. That cleanup is guarded by -mmin +10, so a job
+    # chained immediately after this one would skip these dirs entirely
+    # and inherit the space. Ares /tmp lives on the 29 GB root partition
+    # (the node's big disks -- /mnt/ssd, /mnt/hdd, /mnt/nvme -- are not
+    # writable by an unprivileged job), and one 24-iteration sweep leaves
+    # ~6 GB of per-run dirs behind. Four variants' worth of that is what
+    # filled the partition to 100% and failed 10 combinations with
+    # [Errno 28] No space left on device.
+    - 'df -h /tmp | tail -1'
+    - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null 2>&1 || true'
+    - 'rm -rf /tmp/single_node* /tmp/distributed* /tmp/iowarp_chi* /tmp/iowarp_prte_tmp 2>/dev/null || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'echo "reclaimed node-local /tmp:"; df -h /tmp | tail -1'
     - 'RES="$HOME/distributed_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 3"; [ "$n" -ge 3 ] && echo "ALL 3 GREEN" || echo "INCOMPLETE — inspect $RES and the .err log"'
 
 config:
