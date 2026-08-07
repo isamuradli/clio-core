@@ -343,6 +343,27 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
 
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   auto *cfs = CLIO_CFS_CLIENT;
+  // Reconcile deferred writes BEFORE asking (issue #933). Writes now return
+  // before they land, so a queued write has not advanced the published size.
+  // Reporting the stale size here is not a cosmetic staleness: the kernel
+  // caches st_size and CLAMPS READS TO IT, so a stat that under-reports turns
+  // a subsequent read of just-written data into a short read or EOF.
+  //
+  // Client::GetAttr owns the decision of whether that requires waiting, and
+  // makes it far better than an unconditional drain would: it serves from the
+  // shared-memory mirror and only blocks when something in flight reaches PAST
+  // the published end (DeferMaxPendingEnd > published). An overwrite cannot
+  // change a file's size, and overwrites are most of what a steady-state
+  // workload does, so the common case stays IPC-free. Draining on any pending
+  // write instead — the obvious version — measured ~264 us per stat.
+  //
+  // Its answers are deliberately discarded: this callback needs mode, nlink,
+  // times and ownership too, so the authoritative read is still AsyncGetattr
+  // below. What the call buys is the ordering — by the time it returns, any
+  // write that could have grown the file has landed.
+  bool exists = false;
+  clio::run::u64 pending_size = 0;
+  (void)cfs->GetAttr(p, &exists, &pending_size);
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
   if (t->GetReturnCode() != 0 || t->exists_ == 0) {
@@ -797,7 +818,13 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
 
 static int cte_fuse_unlink(const char *path) {
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncUnlink(std::string(path));
+  const std::string p(path);
+  // Drain first (issue #933): a queued write landing after the unlink writes
+  // to a tag that no longer exists, and its latched error would then surface
+  // against a path the caller has already deleted. Also keeps the deferred
+  // registry from holding entries keyed to a dead file.
+  (void)cfs->Flush(p);
+  auto t = cfs->AsyncUnlink(p);
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/EISDIR/EIO
   return rc == 0 ? 0 : -rc;
@@ -807,7 +834,15 @@ static int cte_fuse_truncate(const char *path, cte_off_t size,
                              struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncTruncate(std::string(path), static_cast<clio::run::u64>(size));
+  const std::string p(path);
+  // Drain first (issue #933). Deferred writes are ordered against each other
+  // but NOT against this: a queued write past `size` that lands after the
+  // truncate re-grows the file and resurrects bytes the caller just discarded.
+  // Unlike stat, there is no cheap partial answer here -- the whole point is
+  // that nothing may be in flight when the length changes -- so this drains
+  // unconditionally. ftruncate is rare next to write(2); correctness wins.
+  (void)cfs->Flush(p);
+  auto t = cfs->AsyncTruncate(p, static_cast<clio::run::u64>(size));
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
@@ -1056,6 +1091,14 @@ static int cte_fuse_rename(const char *from, const char *to,
   if (flags != 0) {
     return -EINVAL;  // RENAME_EXCHANGE / RENAME_WHITEOUT unsupported
   }
+  // Drain BOTH names first (issue #933). The deferred registry is keyed by
+  // PATH, so a write still queued against `from` when the rename lands would
+  // be flushed to a name that no longer exists -- and no later Flush(to) could
+  // find it, because its key is the old path. That is silent data loss, not a
+  // stale read. Draining `to` as well covers the overwrite case, where the
+  // destination has its own writes in flight that must not outlive it.
+  (void)cfs->Flush(std::string(from));
+  (void)cfs->Flush(std::string(to));
   auto t = cfs->AsyncRename(std::string(from), std::string(to));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
