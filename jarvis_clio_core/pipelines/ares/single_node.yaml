@@ -44,314 +44,246 @@ scheduler:
   job_name: perf_eval_single_node
   nodes: 1
   ntasks_per_node: 1
-  # cpus_per_task must stay large: Ares Slurm uses proctrack/cgroup with
-  # ConstrainCores, and a 1-core cgroup starves clio_run's dedicated workers
-  # alongside FUSE + ior ranks.
   cpus_per_task: 32
   partition: debug
-  time: "12:00:00"
+  time: '12:00:00'
   output: ${HOME}/single_node-%j.out
   error: ${HOME}/single_node-%j.err
-  # Uncomment to steer clear of nodes with a broken fakeroot uidmap.
-  # exclude: "ares-comp-15,ares-comp-17"
-  # MUST stay literally identical to config.hostfile below.
-  hostfile: "${HOME}/.jarvis-perf-eval/single_node_hostfile.txt"
+  hostfile: ${HOME}/.jarvis-perf-eval/single_node_hostfile.txt
   pre_cmds:
-    # 1) fakeroot GID fix: Slurm hands the job the project primary GID;
-    #    rootless --fakeroot validates the GID map against group == $USER.
-    #    Guarded self-re-exec of this job script under the personal group.
-    - 'if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi'
-    # 2) The host launcher toolchain.
-    #
-    #    apptainer is NOT set up here. It is declared under config.host_pkgs
-    #    below, and jarvis provisions it itself: probe with `spack location -i`,
-    #    `spack install apptainer~suid` if absent, then fold what `spack load`
-    #    sets into its own process environment so every container subprocess it
-    #    spawns resolves the binary. That replaced a hand-built spack view and
-    #    its PERF_EVAL_VIEW override knob -- see the README.
-    #
-    #    Two things still need doing in the shell, because they happen before
-    #    jarvis is running:
-    #      a. jarvis itself, from its venv -- the generated sbatch script calls
-    #         bare `jarvis ppl run`. Override JARVIS_VENV before submitting.
-    #      b. apptainer for step 4's stale-instance reap, resolved straight out
-    #         of the spack install prefix (no view). Best-effort: on a first-ever
-    #         run apptainer is not installed yet and there is nothing stale to
-    #         reap, so an empty result is fine and step 4 guards on it.
-    #    Pure PATH assignment -- no `spack load` / `conda activate`, which are
-    #    shell functions that misbehave under `set -euo pipefail`.
-    - 'APPTAINER_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack location -i apptainer~suid 2>/dev/null || true )"'
-    - 'PATH="${APPTAINER_PREFIX:+$APPTAINER_PREFIX/bin:}${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
-    - 'command -v jarvis >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
-    - 'echo "toolchain: jarvis=$(command -v jarvis) spack_root=${SPACK_ROOT:-$HOME/spack} apptainer=$(command -v apptainer || echo "<not yet installed; host_pkgs will install it>")"'
-    # 3) SIF gate: fail fast if the image was never staged.
-    #    pre_cmds are verbatim shell, so resolve jarvis's shared_dir here.
-    - 'JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)'
-    - 'SIF="$JSD/containers/iowarp-perf-eval.sif"; [ -n "$JSD" ] && [ -f "$SIF" ] || { echo "ERROR: SIF missing: $SIF — build via jarvis-cd docker/build_perf_eval_image.sh" >&2; exit 1; }'
-    # 4) stale-state cleanup: ghost daemons/instances from a crashed prior
-    #    run wedge this one (port 9413, /dev/shm segments, leftover per-run
-    #    /tmp). pkill patterns are BRACKETED so they never match this
-    #    script's own argv. The instance reap is guarded on apptainer
-    #    resolving in step 2b -- see the note there.
-    - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null 2>&1 || true'
-    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
-    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
-    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
-    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
-    - 'find /tmp -maxdepth 1 \( -name "single_node*" -o -name "distributed*" \) -mmin +10 -exec rm -rf {} + 2>/dev/null || true'
-    - 'rm -rf /tmp/iowarp_chi* 2>/dev/null || true'
-    # 5) experiment dirs + repo registration + clean-slate results (the
-    #    sweep runner resumes over an existing results.csv and would skip
-    #    previously-failed rows)
-    - 'mkdir -p "$HOME/perf_eval_scratch/single_node/nfs" "$HOME/perf_eval_scratch/single_node/jfs_data" "$HOME/single_node_results"'
-    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
-    - 'rm -f "$HOME/single_node_results/results.csv"'
+  - if [ "$(id -gn)" != "$USER" ] && getent group "$USER" >/dev/null 2>&1; then echo "re-exec under group
+    $USER for apptainer --fakeroot"; exec sg "$USER" -c "exec bash \"$0\""; fi
+  - APPTAINER_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack
+    location -i apptainer~suid 2>/dev/null || true )"
+  - PATH="${APPTAINER_PREFIX:+$APPTAINER_PREFIX/bin:}${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"
+  - 'command -v jarvis >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})"
+    >&2; exit 1; }'
+  - 'echo "toolchain: jarvis=$(command -v jarvis) spack_root=${SPACK_ROOT:-$HOME/spack} apptainer=$(command
+    -v apptainer || echo "<not yet installed; host_pkgs will install it>")"'
+  - JSD=$(grep -hE "^[[:space:]]*shared_dir:" "$HOME"/.ppi-jarvis/*.yaml 2>/dev/null | head -1 | sed -E
+    "s/^[[:space:]]*shared_dir:[[:space:]]*//" | tr -d "\"" || true)
+  - "SIF=\"$JSD/containers/iowarp-perf-eval.sif\"; [ -n \"$JSD\" ] && [ -f \"$SIF\" ] || { echo \"ERROR:\
+    \ SIF missing: $SIF \u2014 build via jarvis-cd docker/build_perf_eval_image.sh\" >&2; exit 1; }"
+  - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null
+    2>&1 || true'
+  - pkill -9 -f "[c]himaera" 2>/dev/null || true
+  - pkill -9 -f "[c]lio_run" 2>/dev/null || true
+  - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+  - rm -f /dev/shm/chi_* 2>/dev/null || true
+  - find /tmp -maxdepth 1 \( -name "single_node*" -o -name "distributed*" \) -mmin +10 -exec rm -rf {}
+    + 2>/dev/null || true
+  - rm -rf /tmp/iowarp_chi* 2>/dev/null || true
+  - mkdir -p "$HOME/perf_eval_scratch/single_node/nfs" "$HOME/perf_eval_scratch/single_node/jfs_data"
+    "$HOME/single_node_results"
+  - jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true
+  - rm -f "$HOME/single_node_results/results.csv"
   post_cmds:
-    # Reclaim node-local /tmp NOW rather than leaving it for the next
-    # job's pre_cmd. That cleanup is guarded by -mmin +10, so a job
-    # chained immediately after this one would skip these dirs entirely
-    # and inherit the space. Ares /tmp lives on the 29 GB root partition
-    # (the node's big disks -- /mnt/ssd, /mnt/hdd, /mnt/nvme -- are not
-    # writable by an unprivileged job), and one 24-iteration sweep leaves
-    # ~6 GB of per-run dirs behind. Four variants' worth of that is what
-    # filled the partition to 100% and failed 10 combinations with
-    # [Errno 28] No space left on device.
-    - 'df -h /tmp | tail -1'
-    - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null 2>&1 || true'
-    - 'rm -rf /tmp/single_node* /tmp/distributed* /tmp/iowarp_chi* /tmp/iowarp_prte_tmp 2>/dev/null || true'
-    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
-    - 'echo "reclaimed node-local /tmp:"; df -h /tmp | tail -1'
-    - 'RES="$HOME/single_node_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 24"; [ "$n" -ge 24 ] && echo "ALL 24 GREEN" || echo "INCOMPLETE — inspect $RES and the .err log"'
-
+  - df -h /tmp | tail -1
+  - '{ command -v apptainer >/dev/null 2>&1 && timeout 30 apptainer instance stop --all; } >/dev/null
+    2>&1 || true'
+  - rm -rf /tmp/single_node* /tmp/distributed* /tmp/iowarp_chi* /tmp/iowarp_prte_tmp 2>/dev/null || true
+  - rm -f /dev/shm/chi_* 2>/dev/null || true
+  - echo "reclaimed node-local /tmp:"; df -h /tmp | tail -1
+  - "RES=\"$HOME/single_node_results/results.csv\"; n=$(grep -c success \"$RES\" 2>/dev/null || true);\
+    \ n=${n:-0}; echo \"successful rows: $n / 24\"; [ \"$n\" -ge 24 ] && echo \"ALL 24 GREEN\" || echo\
+    \ \"INCOMPLETE \u2014 inspect $RES and the .err log\""
 config:
   name: single_node
-
-  # MUST stay literally identical to scheduler.hostfile above.
-  hostfile: "${HOME}/.jarvis-perf-eval/single_node_hostfile.txt"
-
-  # ---- Host prerequisites ------------------------------------------------
-  # Tooling jarvis itself shells out to on the host baremetal, as opposed to
-  # `pkgs` below, which is the workload it deploys. jarvis probes each entry
-  # with `spack location -i`, runs `spack install <spec>` if it is missing,
-  # and folds the resulting `spack load` environment into its own process
-  # environment -- which is what the apptainer `instance start` / `build`
-  # calls need, since those run under a bare LocalExecInfo() and inherit an
-  # unmodified environment.
-  #
-  # `~suid` is NOT optional. The builtin recipe defaults to `+suid`, which
-  # builds a `starter-suid` that must be root-owned: unbuildable unprivileged,
-  # and fatal to the rootless `--fakeroot` path that container_fakeroot below
-  # depends on for the CTE and JuiceFS FUSE mounts.
-  #
-  # The install is a one-time cost on a fresh machine and streams its output
-  # to the job log; later runs find the spec already installed and skip it.
-  # It needs SPACK_ROOT exported into the job -- sbatch inherits the
-  # submitting environment by default, and a non-interactive job shell cannot
-  # see the `spack` shell function an rc file installs.
+  hostfile: ${HOME}/.jarvis-perf-eval/single_node_hostfile.txt
   host_pkgs:
-    - install_method: spack
-      install_query: apptainer~suid
-
-  # ---- Containerized deployment (Ares dev jarvis — APPTAINER) -----------
+  - install_method: spack
+    install_query: apptainer~suid
   base_deploy_mode: container
   container_engine: apptainer
-  # Pre-staged SIF referenced by BASENAME, not a path: jarvis resolves it to
-  #   <jarvis shared_dir>/containers/iowarp-perf-eval.sif
-  # container_uri is UNSET, so jarvis trusts this SIF and performs no
-  # pull/build. Not env-expanded — keep it a bare basename.
-  container_image: "iowarp-perf-eval"
-  # The CTE and JuiceFS FUSE mounts need CAP_SYS_ADMIN *effective* inside the
-  # container. Under a non-setuid apptainer only --fakeroot supplies it
-  # (--add-caps SYS_ADMIN is a no-op rootless, and fusermount then fails to
-  # open /dev/fuse). With fakeroot, container_caps and a /dev/fuse bind are
-  # both unnecessary.
+  container_image: iowarp-perf-eval
   container_fakeroot: true
-  # Redirect in-container /tmp to NODE-LOCAL disk. Default jarvis backs
-  # apptainer /tmp with an NFS overlay, which breaks chimaera's IPC unix
-  # sockets and would put the JuiceFS cache on NFS. tmp_bind_root makes jarvis
-  # bind <root>/single_node/tmp -> /tmp from local disk instead.
-  tmp_bind_root: "/tmp"
-  # Bind a shared-FS scratch dir into the instance. Applied at `apptainer
-  # instance start` (the same mechanism as tmp_bind_root), so unlike a
-  # per-exec --bind it takes effect. Required because inside a --fakeroot
-  # instance $HOME is the overlay, not a host bind: without this, nfs_ior's
-  # out and juicefs's data_dir would land on ephemeral node-local storage
-  # instead of real NFS. Jarvis does not create bind sources — the pre_cmd
-  # mkdir above must run first or instance start fails.
+  tmp_bind_root: /tmp
   container_binds:
-    - ${HOME}/perf_eval_scratch:${HOME}/perf_eval_scratch
-
+  - ${HOME}/perf_eval_scratch:${HOME}/perf_eval_scratch
   env:
-    # In-container memfd dir for chimaera (container /tmp is private + writable).
-    CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
-
+    CLIO_MEMFD_DIR: /tmp/iowarp_chimaera
   pkgs:
-    # ---- Services (started in order; stopped in reverse) -----------------
-    # Redis: metadata engine for JuiceFS (DB 1) AND server for redis-benchmark
-    # (DB 0). One server covers both; no persistence keeps it a fair in-memory
-    # peer of the CTE RAM tier.
-    - pkg_type: builtin.redis
-      pkg_name: redis
-      port: 6379
-      sleep: 4
-
-    # clio_run runtime daemon (shm IPC for single-node). swim_enabled: false
-    # avoids mid-IOR SWIM "node confirmed dead" cascades.
-    - pkg_type: jarvis_clio_core.clio_runtime
-      pkg_name: runtime
-      num_threads: 4
-      port: 9413
-      ipc_mode: "shm"
-      log_level: "info"
-      sleep: 4
-      swim_enabled: false
-
-    # CTE pool, single RAM tier. 24 GiB = 12x the 2 GiB peak ior write set
-    # (32 ranks x 64 MiB block). pool_name stays at its default
-    # clio_cte_core == the C++ kCtePoolName constant — required so the FUSE
-    # client's AsyncCreate composes against the same pool (see the pool_name
-    # menu text for the cross-node race this avoids).
-    - pkg_type: jarvis_clio_core.clio_cte
-      pkg_name: cte_core
-      devices:
-        - ["ram::cte_ram_tier1", "24GB", 1.0]
-      dpe_type: "max_bw"
-      neighborhood: 1
-      pool_query: "local"
-      default_target_timeout_ms: 30000
-      poll_period_ms: 5000
-
-    # CTE libfuse mount (in-container): the "+ libfuse" path the ior driver
-    # below writes through (POSIX -> FUSE -> CTE).
-    - pkg_type: jarvis_clio_core.clio_cte_libfuse
-      pkg_name: cte_fuse
-      # FUSE mountpoint on NODE-LOCAL /tmp (writable via tmp_bind_root), NOT
-      # /mnt: the image's /mnt is read-only SquashFS.
-      mountpoint: /tmp/cte_mnt
-      log_level: "info"
-      extra_fuse_args: "-f"
-      sleep: 2
-
-    # JuiceFS: format (storage=file) + FUSE mount. Object store on the bound
-    # shared-FS scratch (real NFS, bypasses the overlay); mount + cache on
-    # in-container node-local /tmp (a distributed-FS cache stays node-local).
-    - pkg_type: builtin.juicefs
-      pkg_name: juicefs
-      meta_url: "redis://127.0.0.1:6379/1"
-      storage: file
-      data_dir: ${HOME}/perf_eval_scratch/single_node/jfs_data
-      mountpoint: /tmp/jfs_mnt
-      cache_dir: /tmp/juicefs_cache
-      name: jfsbench
-      format_fresh: true
-      mount_wait: 20
-
-    # ---- Benchmark drivers (Applications; run sequentially) --------------
-    # builtin.ior. Shared keys: api posix, write+read,
-    # fpp (file-per-process — REQUIRED through per-node FUSE mounts), fixed
-    # block 64m per rank (data-bounded runtime; the xfer sweep below is the
-    # I/O-size axis), stonewall 120 (ior -D: phase runtime cap). log: is left
-    # UNSET on purpose — builtin.ior then defaults it to each package's own
-    # shared_dir/ior.log, which is host-bound and auto-distinct per package.
-    # An explicit ${HOME}/..._results/*.log silently lost every stat: inside
-    # the --fakeroot instance $HOME is the overlay (not a host bind) and the
-    # log parent dir does not exist there, so ior's `tee <log>` failed and the
-    # host-side stat parser found nothing.
-    # 1) NFS: ior against real NFS via the bound perf_eval_scratch (an unbound $HOME
-    #    path would hit the fakeroot overlay, not NFS — see container_binds).
-    - pkg_type: builtin.ior
-      pkg_name: nfs_ior
-      api: posix
-      write: true
-      read: true
-      fpp: true
-      xfer: "4k"
-      block: "64m"
-      nprocs: 1
-      ppn: 1
-      stonewall: 120
-      out: ${HOME}/perf_eval_scratch/single_node/nfs/ior_nfs.bin
-
-    # 2) CTE + libfuse: ior through the CTE FUSE mount.
-    - pkg_type: builtin.ior
-      pkg_name: cte_ior
-      api: posix
-      write: true
-      read: true
-      fpp: true
-      xfer: "4k"
-      block: "64m"
-      nprocs: 1
-      ppn: 1
-      stonewall: 120
-      out: /tmp/cte_mnt/ior_cte.bin
-
-    # 3) redis: builtin.redis-benchmark (SET/GET -> -t set,get; --csv stats).
-    #    The "threads" axis drives clients (-c) AND nthreads (--threads),
-    #    zipped equal: a row means N connections driven by N I/O threads.
-    #    count (-n) is zipped with req_size so total data stays ~1 GiB
-    #    (count = 1 GiB / req_size), keeping the working set axis-independent.
-    - pkg_type: builtin.redis-benchmark
-      pkg_name: redis_bench
-      port: 6379
-      write: true
-      read: true
-      req_size: 4096
-      count: 262144
-      clients: 1
-      nthreads: 1
-
-    # 4) juicefs: ior through the JuiceFS FUSE mount.
-    - pkg_type: builtin.ior
-      pkg_name: jfs_ior
-      api: posix
-      write: true
-      read: true
-      fpp: true
-      xfer: "4k"
-      block: "64m"
-      nprocs: 1
-      ppn: 1
-      stonewall: 120
-      out: /tmp/jfs_mnt/ior_jfs.bin
-
+  - pkg_type: builtin.redis
+    pkg_name: redis
+    port: 6379
+    sleep: 4
+  - pkg_type: jarvis_clio_core.clio_runtime
+    pkg_name: runtime
+    num_threads: 4
+    port: 9413
+    ipc_mode: shm
+    log_level: info
+    sleep: 4
+    swim_enabled: false
+    first_busy_wait: 200000
+  - pkg_type: jarvis_clio_core.clio_cte
+    pkg_name: cte_core
+    devices:
+    - - ram::cte_ram_tier1
+      - 24GB
+      - 1.0
+    dpe_type: max_bw
+    neighborhood: 1
+    pool_query: local
+    default_target_timeout_ms: 30000
+    poll_period_ms: 5000
+  - pkg_type: jarvis_clio_core.clio_cte_libfuse
+    pkg_name: cte_fuse
+    mountpoint: /tmp/cte_mnt
+    log_level: info
+    extra_fuse_args: -f
+    sleep: 2
+  - pkg_type: builtin.juicefs
+    pkg_name: juicefs
+    meta_url: redis://127.0.0.1:6379/1
+    storage: file
+    data_dir: ${HOME}/perf_eval_scratch/single_node/jfs_data
+    mountpoint: /tmp/jfs_mnt
+    cache_dir: /tmp/juicefs_cache
+    name: jfsbench
+    format_fresh: true
+    mount_wait: 20
+  - pkg_type: builtin.ior
+    pkg_name: nfs_ior
+    api: posix
+    write: true
+    read: true
+    fpp: true
+    xfer: 4k
+    block: 64m
+    nprocs: 1
+    ppn: 1
+    stonewall: 120
+    out: ${HOME}/perf_eval_scratch/single_node/nfs/ior_nfs.bin
+  - pkg_type: builtin.ior
+    pkg_name: cte_ior
+    api: posix
+    write: true
+    read: true
+    fpp: true
+    xfer: 4k
+    block: 64m
+    nprocs: 1
+    ppn: 1
+    stonewall: 120
+    out: /tmp/cte_mnt/ior_cte.bin
+  - pkg_type: builtin.redis-benchmark
+    pkg_name: redis_bench
+    port: 6379
+    write: true
+    read: true
+    req_size: 4096
+    count: 262144
+    clients: 1
+    nthreads: 1
+  - pkg_type: builtin.ior
+    pkg_name: jfs_ior
+    api: posix
+    write: true
+    read: true
+    fpp: true
+    xfer: 4k
+    block: 64m
+    nprocs: 1
+    ppn: 1
+    stonewall: 120
+    out: /tmp/jfs_mnt/ior_jfs.bin
 vars:
-  # I/O size, applied to all four drivers at once (zipped, length 4). 1m = the
-  # issue's 1024 KB point. redis req_size is in BYTES; count is the matching
-  # ~1 GiB request budget (1 GiB / req_size), so 4k<->262144, 64k<->16384,
-  # 128k<->8192, 1m<->1024 stay paired.
-  nfs_ior.xfer:        ["4k",   "64k",  "128k", "1m"]
-  cte_ior.xfer:        ["4k",   "64k",  "128k", "1m"]
-  jfs_ior.xfer:        ["4k",   "64k",  "128k", "1m"]
-  redis_bench.req_size: [4096,  65536,  131072, 1048576]
-  redis_bench.count:    [262144, 16384, 8192,   1024]
-
-  # Thread count, applied to all four drivers at once (zipped, length 6).
-  # ior: nprocs AND ppn (single node => equal). redis-benchmark: clients (-c)
-  # AND nthreads (--threads), zipped equal.
-  nfs_ior.nprocs:      [1, 2, 4, 8, 16, 32]
-  nfs_ior.ppn:         [1, 2, 4, 8, 16, 32]
-  cte_ior.nprocs:      [1, 2, 4, 8, 16, 32]
-  cte_ior.ppn:         [1, 2, 4, 8, 16, 32]
-  jfs_ior.nprocs:      [1, 2, 4, 8, 16, 32]
-  jfs_ior.ppn:         [1, 2, 4, 8, 16, 32]
-  redis_bench.clients: [1, 2, 4, 8, 16, 32]
-  redis_bench.nthreads: [1, 2, 4, 8, 16, 32]
-
+  nfs_ior.xfer:
+  - 4k
+  - 64k
+  - 128k
+  - 1m
+  cte_ior.xfer:
+  - 4k
+  - 64k
+  - 128k
+  - 1m
+  jfs_ior.xfer:
+  - 4k
+  - 64k
+  - 128k
+  - 1m
+  redis_bench.req_size:
+  - 4096
+  - 65536
+  - 131072
+  - 1048576
+  redis_bench.count:
+  - 262144
+  - 16384
+  - 8192
+  - 1024
+  nfs_ior.nprocs:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  nfs_ior.ppn:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  cte_ior.nprocs:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  cte_ior.ppn:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  jfs_ior.nprocs:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  jfs_ior.ppn:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  redis_bench.clients:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  redis_bench.nthreads:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
 loop:
-  # Outer group: I/O size (+ redis request budget), 4 values.
-  - [nfs_ior.xfer, cte_ior.xfer, jfs_ior.xfer,
-     redis_bench.req_size, redis_bench.count]
-  # Inner group: thread count, 6 values  =>  4 x 6 = 24 combinations.
-  - [nfs_ior.nprocs, nfs_ior.ppn, cte_ior.nprocs, cte_ior.ppn,
-     jfs_ior.nprocs, jfs_ior.ppn, redis_bench.clients, redis_bench.nthreads]
-
-# Per-combination wall-clock backstop (requires jarvis-cd @ dev; older
-# versions silently ignore this key). With stonewall capping each ior
-# phase at 120 s, a healthy combo stays well under 1200; expiry records the
-# row failed and the sweep continues — one wedged package can no longer lose
-# the other 23 rows of the shared allocation.
+- - nfs_ior.xfer
+  - cte_ior.xfer
+  - jfs_ior.xfer
+  - redis_bench.req_size
+  - redis_bench.count
+- - nfs_ior.nprocs
+  - nfs_ior.ppn
+  - cte_ior.nprocs
+  - cte_ior.ppn
+  - jfs_ior.nprocs
+  - jfs_ior.ppn
+  - redis_bench.clients
+  - redis_bench.nthreads
 run_timeout: 1200
-
-repeat: 1                       # bump to 3 for variance (~3x wall-clock)
-output: "${HOME}/single_node_results"
+repeat: 1
+output: ${HOME}/single_node_results

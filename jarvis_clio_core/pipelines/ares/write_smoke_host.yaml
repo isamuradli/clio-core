@@ -24,18 +24,28 @@ scheduler:
   hostfile: ${HOME}/.jarvis-perf-eval/write_smoke_host_hostfile.txt
   pre_cmds:
   - APPTAINER_PREFIX=""
-  - IOWARP_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack
-    location -i iowarp 2>/dev/null || true )"
+  - 'IOWARP_SPEC_UNDER_TEST="${IOWARP_SPEC_UNDER_TEST:-iowarp@git.933-perf-eval-host-pkgs-apptainer=dev}"
+
+    IOWARP_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack
+    location -i "$IOWARP_SPEC_UNDER_TEST" 2>/dev/null || true )"'
   - IOR_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack location
     -i ior 2>/dev/null || true )"
+  - MPI_PREFIX="$( . "${SPACK_ROOT:-$HOME/spack}/share/spack/setup-env.sh" >/dev/null 2>&1 && spack location
+    -i openmpi 2>/dev/null || true )"
+  - '[ -n "$MPI_PREFIX" ] || { echo "ERROR: openmpi not installed in spack" >&2; exit 1; }'
   - '[ -n "$IOWARP_PREFIX" ] || { echo "ERROR: iowarp not installed in spack" >&2; exit 1; }'
   - '[ -n "$IOR_PREFIX" ] || { echo "ERROR: ior not installed in spack" >&2; exit 1; }'
-  - PATH="$IOWARP_PREFIX/bin:$IOR_PREFIX/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"
-  - LD_LIBRARY_PATH="$IOWARP_PREFIX/lib:$IOWARP_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+  - PATH="$IOWARP_PREFIX/bin:$IOR_PREFIX/bin:$MPI_PREFIX/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  - LD_LIBRARY_PATH="$IOWARP_PREFIX/lib:$IOWARP_PREFIX/lib64:$MPI_PREFIX/lib:$MPI_PREFIX/lib64"
   - export LD_LIBRARY_PATH
   - 'command -v jarvis >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH" >&2; exit 1; }'
-  - 'echo "toolchain: jarvis=$(command -v jarvis) clio_run=$(command -v clio_run) clio_cte_fuse=$(command
-    -v clio_cte_fuse) ior=$(command -v ior)"'
+  - 'echo "toolchain: clio_run=$(command -v clio_run) clio_cte_fuse=$(command -v clio_cte_fuse) ior=$(command
+    -v ior) mpiexec=$(command -v mpiexec)"'
+  - echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+  - 'case ":$LD_LIBRARY_PATH:$PATH:" in *"/iowarp/core/build/bin"*) echo "ERROR: stale build tree still
+    on path" >&2; exit 1;; esac'
+  - 'command -v mpiexec >/dev/null 2>&1 || { echo "ERROR: mpiexec not on PATH" >&2; exit 1; }'
+  - 'echo "iowarp spec under test: $IOWARP_SPEC_UNDER_TEST"; echo "iowarp prefix: $IOWARP_PREFIX"'
   - pkill -9 -f "[c]himaera" 2>/dev/null || true
   - pkill -9 -f "[c]lio_run" 2>/dev/null || true
   - pkill -9 -f "[c]lio_cte_fuse" 2>/dev/null || true
@@ -44,9 +54,13 @@ scheduler:
   - rm -f /dev/shm/chi_* 2>/dev/null || true
   - rm -rf /tmp/iowarp_chi* /tmp/write_smoke_host* /tmp/cte_mnt_host 2>/dev/null || true
   - mkdir -p "$HOME/write_smoke_host_results"
+  - nohup bash -c 'for i in $(seq 1 400); do { date +%s; ps -L -o pid,tid,pcpu,comm -C clio_cte_fuse 2>/dev/null
+    | head -12; ps -o pid,pcpu,comm -C clio_run 2>/dev/null | head -4; uptime; } ; sleep 1; done' > "$HOME/write_smoke_host_results/cpu_sample.txt"
+    2>&1 &
   - jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true
   - rm -f "$HOME/write_smoke_host_results/results.csv"
   post_cmds:
+  - pkill -f 'while :; do :; done' 2>/dev/null || true
   - fusermount3 -u -z /tmp/cte_mnt_host 2>/dev/null || true
   - pkill -9 -f "[c]lio_run" 2>/dev/null || true
   - rm -rf /tmp/iowarp_chi* /tmp/write_smoke_host* 2>/dev/null || true
@@ -61,6 +75,10 @@ config:
     install_query: apptainer~suid
   env:
     CLIO_MEMFD_DIR: /tmp/iowarp_chimaera_${USER}
+    CLIO_CFS_PROFILE_SUBMIT: '1'
+    CLIO_CTE_FUSE_WRITE_STATS: '1'
+    CLIO_CTE_FUSE_COALESCE: '1'
+    CLIO_CTE_FUSE_WRITE_STATS_EVERY: '2000'
   pkgs:
   - pkg_type: jarvis_clio_core.clio_runtime
     pkg_name: runtime
@@ -70,11 +88,12 @@ config:
     log_level: info
     sleep: 4
     swim_enabled: false
+    first_busy_wait: 200000
   - pkg_type: jarvis_clio_core.clio_cte
     pkg_name: cte_core
     devices:
     - - ram::cte_ram_tier1
-      - 24GB
+      - 4GB
       - 1.0
     dpe_type: max_bw
     neighborhood: 1
@@ -90,9 +109,9 @@ config:
     entry_timeout: 1.0
     negative_timeout: 1.0
     writeback: false
-    max_write_kib: 1024
-    max_background: 64
-    max_readahead_kib: 1024
+    max_write_kib: 0
+    max_background: 0
+    max_readahead_kib: 0
     sleep: 2
   - pkg_type: builtin.ior
     pkg_name: cte_ior
@@ -106,20 +125,18 @@ config:
     ppn: 1
     stonewall: 120
     out: /tmp/cte_mnt_host/ior_cte.bin
+  mpi_cmd: mpiexec --mca btl_tcp_if_include eno1 --mca oob_tcp_if_include eno1
 vars:
   cte_ior.xfer:
   - 4k
-  - 1m
   cte_ior.nprocs:
   - 1
-  - 8
   cte_ior.ppn:
   - 1
-  - 8
 loop:
 - - cte_ior.xfer
 - - cte_ior.nprocs
   - cte_ior.ppn
 run_timeout: 600
-repeat: 1
+repeat: 2
 output: ${HOME}/write_smoke_host_results
