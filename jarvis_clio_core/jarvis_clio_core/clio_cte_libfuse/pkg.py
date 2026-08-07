@@ -50,6 +50,74 @@ class ClioCteLibfuse(Service):
                 'type': str,
                 'default': '',
             },
+            # ---- small-I/O amortization (issue #933) --------------------
+            # Every default below is the adapter's historical behaviour, so
+            # an unconfigured mount is unchanged. They matter because that
+            # behaviour costs one kernel->userspace upcall per operation,
+            # which is the whole small-I/O deficit: at 4 KiB / 1 rank CTE
+            # measured 15.0 MiB/s (3,840 ops/s) against JuiceFS's 540 MiB/s
+            # (138,300 ops/s) on the same node. JuiceFS is also FUSE; it
+            # ships 1.0s attr/entry caches and a client-side write buffer,
+            # so the kernel absorbs most ops. At 1 MiB the two invert and
+            # CTE wins, which is what identifies this as per-op count
+            # rather than bandwidth or the CTE data path.
+            {
+                'name': 'attr_timeout',
+                'msg': ('Seconds the kernel may cache file attributes. 0 '
+                        'sends every getattr to the chimod. This also gates '
+                        'READ throughput, not just metadata: at 0 the kernel '
+                        'revalidates constantly and the page cache never '
+                        'survives. JuiceFS uses 1.0. Costs a staleness '
+                        'window on st_nlink for hard links.'),
+                'type': float,
+                'default': 0.0,
+            },
+            {
+                'name': 'entry_timeout',
+                'msg': ('Seconds the kernel may cache directory entries '
+                        '(name -> inode). JuiceFS uses 1.0.'),
+                'type': float,
+                'default': 0.0,
+            },
+            {
+                'name': 'negative_timeout',
+                'msg': ('Seconds the kernel may cache failed lookups. Helps '
+                        'create-heavy paths, which probe before creating.'),
+                'type': float,
+                'default': 0.0,
+            },
+            {
+                'name': 'writeback',
+                'msg': ('Enable FUSE_CAP_WRITEBACK_CACHE so the kernel '
+                        'buffers and coalesces writes instead of sending '
+                        'each one through synchronously. The kernel then '
+                        'owns file size, so a partial-page write is padded '
+                        'to page granularity and readers observe the '
+                        "kernel's size rather than the chimod's."),
+                'type': bool,
+                'default': False,
+            },
+            {
+                'name': 'max_write_kib',
+                'msg': ('Max bytes per write upcall, in KiB. 0 keeps the '
+                        'libfuse default. The kernel clamps an over-large '
+                        'request rather than rejecting it.'),
+                'type': int,
+                'default': 0,
+            },
+            {
+                'name': 'max_background',
+                'msg': ('Max async requests in flight before the kernel '
+                        'throttles the queue. 0 keeps the default.'),
+                'type': int,
+                'default': 0,
+            },
+            {
+                'name': 'max_readahead_kib',
+                'msg': 'Kernel readahead window in KiB. 0 keeps the default.',
+                'type': int,
+                'default': 0,
+            },
             {
                 'name': 'sleep',
                 'msg': 'Seconds to wait after launch for the FUSE handshake.',
@@ -74,6 +142,27 @@ class ClioCteLibfuse(Service):
         cte_pool = str(self.config.get('cte_pool', '') or '').strip()
         if cte_pool:
             self.setenv('CLIO_CTE_POOL', cte_pool)
+
+        # Small-I/O tuning (issue #933). Emitted unconditionally, including
+        # the zeros: the adapter echoes its resolved tuning to stderr at
+        # mount, and a benchmark that cannot tell a tuned mount from an
+        # untuned one is how the deficit went unexplained in the first place.
+        # Sent as env because libfuse's argv parser owns "-o" and an
+        # unrecognized key there aborts the mount.
+        self.setenv('CLIO_CTE_FUSE_ATTR_TIMEOUT',
+                    str(float(self.config.get('attr_timeout', 0.0))))
+        self.setenv('CLIO_CTE_FUSE_ENTRY_TIMEOUT',
+                    str(float(self.config.get('entry_timeout', 0.0))))
+        self.setenv('CLIO_CTE_FUSE_NEGATIVE_TIMEOUT',
+                    str(float(self.config.get('negative_timeout', 0.0))))
+        self.setenv('CLIO_CTE_FUSE_WRITEBACK',
+                    '1' if self.config.get('writeback', False) else '0')
+        self.setenv('CLIO_CTE_FUSE_MAX_WRITE_KIB',
+                    str(int(self.config.get('max_write_kib', 0))))
+        self.setenv('CLIO_CTE_FUSE_MAX_BACKGROUND',
+                    str(int(self.config.get('max_background', 0))))
+        self.setenv('CLIO_CTE_FUSE_MAX_READAHEAD_KIB',
+                    str(int(self.config.get('max_readahead_kib', 0))))
 
     def start(self):
         mp = self.config['mountpoint']

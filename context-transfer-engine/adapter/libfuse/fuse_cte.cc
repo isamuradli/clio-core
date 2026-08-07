@@ -40,6 +40,7 @@
 #include <vector>
 #include <cerrno>                 // errno
 #include <cstdio>                 // snprintf, fprintf
+#include <cstdlib>                // getenv, strtod, strtoul
 #include <fcntl.h>                // O_CREAT, O_RDWR
 #ifdef __linux__
 #include <linux/falloc.h>         // FALLOC_FL_* (fallocate mode flags)
@@ -111,6 +112,64 @@ struct CfsHandle {
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
 }
+
+// ---- mount tuning read from the environment (issue #933) -------------------
+// Env rather than "-o" mount options: libfuse's own argv parser owns -o, and
+// an unrecognized key there aborts the mount. A malformed VALUE here is a
+// deployment mistake worth surfacing loudly, but not worth refusing to mount
+// over -- warn and use the default, which is the historical behaviour.
+
+double cte_fuse_env_double(const char *name, double dflt) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || *v == '\0') {
+    return dflt;
+  }
+  char *end = nullptr;
+  const double parsed = std::strtod(v, &end);
+  if (end == v || *end != '\0' || parsed < 0.0) {
+    fprintf(stderr, "WARNING: %s='%s' is not a non-negative number; using %g\n",
+            name, v, dflt);
+    return dflt;
+  }
+  return parsed;
+}
+
+unsigned cte_fuse_env_uint(const char *name, unsigned dflt) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || *v == '\0') {
+    return dflt;
+  }
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(v, &end, 10);
+  if (end == v || *end != '\0' || parsed > UINT_MAX) {
+    fprintf(stderr, "WARNING: %s='%s' is not an unsigned integer; using %u\n",
+            name, v, dflt);
+    return dflt;
+  }
+  return static_cast<unsigned>(parsed);
+}
+
+bool cte_fuse_env_bool(const char *name, bool dflt) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || *v == '\0') {
+    return dflt;
+  }
+  // Accept the spellings a YAML pipeline is likely to produce. Anything else
+  // is a typo, and silently reading it as false would quietly disable the very
+  // thing the operator was trying to switch on.
+  const std::string s(v);
+  if (s == "1" || s == "true" || s == "True" || s == "TRUE" ||
+      s == "yes" || s == "on") {
+    return true;
+  }
+  if (s == "0" || s == "false" || s == "False" || s == "FALSE" ||
+      s == "no" || s == "off") {
+    return false;
+  }
+  fprintf(stderr, "WARNING: %s='%s' is not a boolean; using %d\n", name, v,
+          static_cast<int>(dflt));
+  return dflt;
+}
 }  // namespace
 
 // ============================================================================
@@ -119,7 +178,6 @@ CfsHandle *GetHandle(struct fuse_file_info *fi) {
 
 static void *cte_fuse_init(struct fuse_conn_info *conn,
                            struct fuse_config *cfg) {
-  (void)conn;
   // Trust the inode numbers we report (st_ino in getattr, d_ino in readdir),
   // both derived from the tag id, instead of letting FUSE auto-generate them.
   // This makes stat and readdir agree on d_ino/st_ino (generic/637), and gives
@@ -130,18 +188,90 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   // in the high-level API; the kernel faults mapped pages through cte_fuse_read
   // and flushes dirty pages through cte_fuse_write. direct_io bypasses the page
   // cache, so the kernel returns ENODEV ("No such device") for any mmap (issue
-  // #597). Writes stay write-through (no FUSE_CAP_WRITEBACK_CACHE), so each
-  // write() still reaches the chimod synchronously and the exact logical size
-  // is preserved; only mmap dirty pages flush lazily, which is inherent to mmap.
+  // #597).
   cfg->direct_io = 0;
-  // Disable the kernel attribute/entry caches. Metadata (size, and especially
-  // st_nlink for hard links) can change without this FUSE process being the one
-  // that triggered the change, and there is no upcall to invalidate the cache.
-  // Without this, e.g. `ln a b; stat a` returns a's stale cached nlink. Every
-  // getattr/lookup goes to the chimod, which is the source of truth.
-  cfg->attr_timeout = 0;
-  cfg->entry_timeout = 0;
-  cfg->negative_timeout = 0;
+
+  // ---- small-I/O amortization (issue #933) --------------------------------
+  // Everything below defaults to the historical write-through, zero-cache
+  // behaviour, so an unconfigured mount behaves exactly as before. They exist
+  // because that behaviour costs a kernel->userspace upcall per operation,
+  // which is the entire small-I/O deficit:
+  //
+  //   4 KiB, 1 rank, measured   CTE 15.0 MiB/s  =   3,840 ops/s
+  //                             JuiceFS 540 MiB/s = 138,300 ops/s
+  //
+  // JuiceFS is also FUSE, on the same kernel, and does not sustain 138k
+  // upcalls/s -- it ships attr/entry caches of 1.0s and a client-side write
+  // buffer, so the kernel absorbs most operations and hands userspace far
+  // fewer, larger ones. The gap is amortization, not FUSE and not the CTE data
+  // path (at 1 MiB the two invert and CTE wins). Note also that a server-side
+  // cache cannot help here: it sits on the far side of the upcall being
+  // counted.
+  //
+  // These are env vars rather than mount options because libfuse's own argv
+  // parser owns "-o"; the deployment sets them alongside CLIO_CTE_POOL.
+
+  // Kernel attribute/entry caches. Zero means every getattr/lookup reaches the
+  // chimod, which is the source of truth -- correct, and the reason for the
+  // historical default: metadata (size, and especially st_nlink for hard
+  // links) can change without this process being the one that triggered it,
+  // and there is no invalidation upcall, so `ln a b; stat a` can return a's
+  // stale cached nlink. A non-zero timeout trades exactly that window for the
+  // upcalls. It also gates READ throughput, not just metadata: with
+  // attr_timeout 0 the kernel revalidates on every access and drops the page
+  // cache whenever size/mtime appear to move, so cached data never survives.
+  cfg->attr_timeout = cte_fuse_env_double("CLIO_CTE_FUSE_ATTR_TIMEOUT", 0.0);
+  cfg->entry_timeout = cte_fuse_env_double("CLIO_CTE_FUSE_ENTRY_TIMEOUT", 0.0);
+  cfg->negative_timeout =
+      cte_fuse_env_double("CLIO_CTE_FUSE_NEGATIVE_TIMEOUT", 0.0);
+
+  // Writeback caching. Off, writes are write-through: every write() reaches
+  // the chimod synchronously and the exact logical size is preserved (only
+  // mmap dirty pages flush lazily, which is inherent to mmap). On, the kernel
+  // buffers and coalesces, and becomes responsible for size -- so a partial
+  // page write is padded to page granularity and the logical size a reader
+  // observes is the kernel's, not the chimod's.
+  if (cte_fuse_env_bool("CLIO_CTE_FUSE_WRITEBACK", false)) {
+    if (conn->capable & FUSE_CAP_WRITEBACK_CACHE) {
+      conn->want |= FUSE_CAP_WRITEBACK_CACHE;
+    } else {
+      fprintf(stderr,
+              "WARNING: CLIO_CTE_FUSE_WRITEBACK set but the kernel does not "
+              "advertise FUSE_CAP_WRITEBACK_CACHE; staying write-through\n");
+    }
+  }
+
+  // Upcall SIZE and concurrency. Raising max_write lets one upcall carry more
+  // bytes (the kernel caps this at its own limit, so an over-large request is
+  // clamped, not rejected); max_background raises how many async requests may
+  // be in flight before the kernel throttles the queue. Zero leaves the
+  // libfuse/kernel default in place.
+  const unsigned max_write_kib =
+      cte_fuse_env_uint("CLIO_CTE_FUSE_MAX_WRITE_KIB", 0);
+  if (max_write_kib > 0) {
+    conn->max_write = max_write_kib * 1024u;
+  }
+  const unsigned max_background =
+      cte_fuse_env_uint("CLIO_CTE_FUSE_MAX_BACKGROUND", 0);
+  if (max_background > 0) {
+    conn->max_background = max_background;
+  }
+  const unsigned max_readahead_kib =
+      cte_fuse_env_uint("CLIO_CTE_FUSE_MAX_READAHEAD_KIB", 0);
+  if (max_readahead_kib > 0) {
+    conn->max_readahead = max_readahead_kib * 1024u;
+  }
+
+  // One line naming the whole tuning state. Without it a mount's cache
+  // behaviour is invisible, and a benchmark cannot tell a tuned mount from an
+  // untuned one -- which is exactly how the deficit above went unexplained.
+  fprintf(stderr,
+          "clio_cte_fuse: attr_timeout=%.3g entry_timeout=%.3g "
+          "negative_timeout=%.3g writeback=%d max_write=%u "
+          "max_background=%u max_readahead=%u\n",
+          cfg->attr_timeout, cfg->entry_timeout, cfg->negative_timeout,
+          (conn->want & FUSE_CAP_WRITEBACK_CACHE) ? 1 : 0, conn->max_write,
+          conn->max_background, conn->max_readahead);
 
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
