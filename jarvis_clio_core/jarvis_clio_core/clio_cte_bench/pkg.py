@@ -39,7 +39,8 @@ class ClioCteBench(Application):
                 'name': 'test_case',
                 'msg': 'Benchmark test case to run',
                 'type': str,
-                'choices': ['Put', 'Get', 'PutGet'],
+                'choices': ['Put', 'Get', 'PutGet',
+                            'PutDefer', 'GetDefer', 'PutGetDefer'],
                 'default': 'Put',
                 'help': 'Put: Write benchmark, Get: Read benchmark, PutGet: Combined write+read benchmark'
             },
@@ -143,8 +144,17 @@ class ClioCteBench(Application):
         self.log("Configuring CTE benchmark application...")
 
         # Validate test_case
-        if self.config['test_case'] not in ['Put', 'Get', 'PutGet']:
-            raise ValueError(f"Invalid test_case: {self.config['test_case']}. Must be Put, Get, or PutGet")
+        # Must track clio_cte_bench.cc's dispatch. The binary has handled the
+        # *Defer cases since the #862/#878 deferred registry landed; this list
+        # did not, so asking for them failed in the wrapper and the benchmark
+        # never ran -- which reads as "the defer path failed" when nothing was
+        # ever executed.
+        valid_cases = ['Put', 'Get', 'PutGet',
+                       'PutDefer', 'GetDefer', 'PutGetDefer']
+        if self.config['test_case'] not in valid_cases:
+            raise ValueError(
+                f"Invalid test_case: {self.config['test_case']}. "
+                f"Must be one of: {', '.join(valid_cases)}")
 
         # Validate num_threads
         if self.config['num_threads'] <= 0:

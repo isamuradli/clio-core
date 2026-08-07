@@ -1,27 +1,28 @@
 # =============================================================================
-# WRITE SMOKE (BAREMETAL) -- fast CTE-only write check, no container.
+# CFS chimod direct benchmark -- write_4k / read_4k only (issue #933).
 # =============================================================================
 #
-# Same 4 points as write_smoke.yaml, but running the HOST spack install
-# directly. There is no SIF, no docker, no apptainer: iowarp and ior are
-# already installed in spack on this cluster, and rebuilding a 2 GB image to
-# test a one-file adapter change costs over an hour for nothing.
+# Drives the filesystem client's own API (CLIO_CFS_CLIENT open/read/write),
+# with no FUSE and no interception, so the number is the chimod path itself.
 #
-# pre_cmds put `spack location -i iowarp` and `... ior` on PATH, so the code
-# under test is whatever `spack install iowarp@<branch>` last produced --
-# a ~minutes rebuild, since every dependency is already installed.
+# Reference points at 4 KiB, 1 thread, same node:
+#   CTE core client, PutDefer   348.7 MiB/s   11.2 us/op
+#   CTE core client, Put         96.5 MiB/s   40.5 us/op
+#   full FUSE path               19.1 MiB/s  ~150 us/op
+# This fills in the middle row: what the filesystem layer costs on top of
+# core, without FUSE in the picture.
 
 scheduler:
   name: slurm
-  job_name: write_smoke_host
+  job_name: cfs_mixed_bench
   nodes: 1
   ntasks_per_node: 1
   cpus_per_task: 32
   partition: debug
-  time: 00:40:00
-  output: ${HOME}/write_smoke_host-%j.out
-  error: ${HOME}/write_smoke_host-%j.err
-  hostfile: ${HOME}/.jarvis-perf-eval/write_smoke_host_hostfile.txt
+  time: 00:30:00
+  output: ${HOME}/cfs_mixed_bench-%j.out
+  error: ${HOME}/cfs_mixed_bench-%j.err
+  hostfile: ${HOME}/.jarvis-perf-eval/cfs_mixed_bench_hostfile.txt
   pre_cmds:
   - APPTAINER_PREFIX=""
   - 'IOWARP_SPEC_UNDER_TEST="${IOWARP_SPEC_UNDER_TEST:-iowarp@git.933-perf-eval-host-pkgs-apptainer=dev}"
@@ -55,33 +56,29 @@ scheduler:
   - fusermount3 -u -z /tmp/cte_mnt_host 2>/dev/null || true
   - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
   - rm -f /dev/shm/chi_* 2>/dev/null || true
-  - rm -rf /tmp/iowarp_chi* /tmp/write_smoke_host* /tmp/cte_mnt_host 2>/dev/null || true
-  - mkdir -p "$HOME/write_smoke_host_results"
+  - rm -rf /tmp/iowarp_chi* /tmp/cfs_mixed_bench* /tmp/cte_mnt_host 2>/dev/null || true
+  - mkdir -p "$HOME/cfs_mixed_bench_results"
   - nohup bash -c 'for i in $(seq 1 400); do { date +%s; ps -L -o pid,tid,pcpu,comm -C clio_cte_fuse 2>/dev/null
-    | head -12; ps -o pid,pcpu,comm -C clio_run 2>/dev/null | head -4; uptime; } ; sleep 1; done' > "$HOME/write_smoke_host_results/cpu_sample.txt"
+    | head -12; ps -o pid,pcpu,comm -C clio_run 2>/dev/null | head -4; uptime; } ; sleep 1; done' > "$HOME/cfs_mixed_bench_results/cpu_sample.txt"
     2>&1 &
   - jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true
-  - rm -f "$HOME/write_smoke_host_results/results.csv"
+  - rm -f "$HOME/cfs_mixed_bench_results/results.csv"
+  - mkdir -p "$HOME/cfs_bench_root"
   post_cmds:
+  - echo "=== CFS chimod direct, write_4k/read_4k only ==="
   - pkill -f 'while :; do :; done' 2>/dev/null || true
   - fusermount3 -u -z /tmp/cte_mnt_host 2>/dev/null || true
   - pkill -9 -f "[c]lio_run" 2>/dev/null || true
-  - rm -rf /tmp/iowarp_chi* /tmp/write_smoke_host* 2>/dev/null || true
+  - rm -rf /tmp/iowarp_chi* /tmp/cfs_mixed_bench* 2>/dev/null || true
   - rm -f /dev/shm/chi_* 2>/dev/null || true
-  - RES="$HOME/write_smoke_host_results/results.csv"; echo "--- results ---"; cat "$RES" 2>/dev/null ||
+  - RES="$HOME/cfs_mixed_bench_results/results.csv"; echo "--- results ---"; cat "$RES" 2>/dev/null ||
     echo "no results"
 config:
-  name: write_smoke_host
-  hostfile: ${HOME}/.jarvis-perf-eval/write_smoke_host_hostfile.txt
-  host_pkgs:
-  - install_method: spack
-    install_query: apptainer~suid
+  name: cfs_mixed_bench
+  hostfile: ${HOME}/.jarvis-perf-eval/cfs_mixed_bench_hostfile.txt
   env:
     CLIO_MEMFD_DIR: /tmp/iowarp_chimaera
-    CLIO_CTE_FUSE_DEFER: '1'
-    CLIO_CFS_CLIENT_SIDE_WRITE: '1'
-    CLIO_CTE_FUSE_WRITE_STATS: '1'
-    CLIO_CTE_FUSE_WRITE_STATS_EVERY: '2000'
+    CLIO_CFS_CLIENT_SIDE_WRITE: ${CLIO_CFS_CLIENT_SIDE_WRITE:-0}
   pkgs:
   - pkg_type: jarvis_clio_core.clio_runtime
     pkg_name: runtime
@@ -96,49 +93,22 @@ config:
     pkg_name: cte_core
     devices:
     - - ram::cte_ram_tier1
-      - 24GB
+      - 1GB
       - 1.0
     dpe_type: max_bw
     neighborhood: 1
     pool_query: local
     default_target_timeout_ms: 30000
     poll_period_ms: 5000
-  - pkg_type: jarvis_clio_core.clio_cte_libfuse
-    pkg_name: cte_fuse
-    mountpoint: /tmp/cte_mnt_host
-    log_level: info
-    extra_fuse_args: -f
-    attr_timeout: 1.0
-    entry_timeout: 1.0
-    negative_timeout: 1.0
-    writeback: false
-    max_write_kib: 1024
-    max_background: 64
-    max_readahead_kib: 1024
-    sleep: 2
-  - pkg_type: builtin.ior
-    pkg_name: cte_ior
-    api: posix
-    write: true
-    read: true
-    fpp: true
-    xfer: 4k
-    block: 64m
-    nprocs: 1
-    ppn: 1
-    stonewall: 120
-    out: /tmp/cte_mnt_host/ior_cte.bin
-vars:
-  cte_ior.xfer:
-  - 4k
-  cte_ior.nprocs:
-  - 1
-  cte_ior.ppn:
-  - 1
-loop:
-- - cte_ior.xfer
-- - cte_ior.nprocs
-  - cte_ior.ppn
-run_timeout: 600
+  - pkg_type: jarvis_clio_core.clio_cfs_bench
+    pkg_name: cfs_bench
+    mix: write_4k=50,read_4k=50
+    duration: 20
+    warmup: 5
+    small_io: 4k
+    max_data: 128m
+    label: cfs_direct
+    threads: 1
 repeat: 1
-output: ${HOME}/write_smoke_host_results
+run_timeout: 600
+output: ${HOME}/cfs_mixed_bench_results

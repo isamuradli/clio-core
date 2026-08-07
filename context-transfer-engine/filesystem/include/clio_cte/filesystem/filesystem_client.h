@@ -551,11 +551,122 @@ class Client : public clio::cte::core::Client {
    *        durability over latency and honouring that is the point of the flag.
    * @return bytes accepted, or -1 with errno set.
    */
+  /** Is the client-side write path enabled? (issue #933)
+   *
+   *  Off by default: it changes which process performs the I/O, and the
+   *  fallback below is what every caller gets today. */
+  static bool ClientSideWriteEnabled() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CFS_CLIENT_SIDE_WRITE");
+      return e != nullptr && !(std::string(e) == "0" || std::string(e) == "false");
+    }();
+    return v;
+  }
+
+  /**
+   * write(2) performed BY THE CLIENT, against CTE core directly.
+   *
+   * The RPC path costs two hops -- client -> filesystem chimod -> core -- and
+   * the chimod's only contribution to the data path is the page split and a
+   * PutBlob per page, both of which the client can do itself: PageName() and
+   * kFsPageSize are shared header, and tag_id comes out of the shm mirror the
+   * client already reads for GetAttr and for the zero-IPC READ fast path,
+   * which does exactly this loop in the other direction.
+   *
+   * Measured motivation, 4 KiB, one thread, clio_cte_bench against the same
+   * runtime: Put 96.5 MiB/s at 40.5 us/op, PutDefer 348.7 MiB/s at 11.2 us/op.
+   * The full FUSE path delivers 19.1 MiB/s. CTE's data path is not the cost;
+   * the hop to the chimod and back is.
+   *
+   * The chimod keeps what is genuinely shared: the descriptor table, the tag,
+   * and the authoritative logical size. Only the size has to come back here,
+   * and it goes as a ZERO-LENGTH write at the end offset -- Runtime::Write's
+   * put loop does not execute for size 0, so it degenerates to exactly the
+   * size CAS and republish, using the existing wire format rather than a new
+   * method. It is deferred like any other write, so it does not block.
+   *
+   * @return bytes written, or -1 with errno set. Returns -2 when this path
+   *         cannot serve the request and the caller must use the RPC (no shm
+   *         mirror, no tag, a directory, or an append pending).
+   */
+  ssize_t WriteClientSide(clio::run::u64 handle, const std::string &path,
+                          clio::run::u64 off, const void *buf, size_t count,
+                          bool sync) {
+    if (count == 0) {
+      return 0;
+    }
+    ShmFileRecord rec;
+    if (!TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
+      return -2;  // caller falls back to the RPC
+    }
+    auto *cte = CLIO_CTE_CLIENT;
+    const clio::cte::core::TagId tag_id = rec.tag_id_;
+    const char *src = static_cast<const char *>(buf);
+    const clio::run::u64 wall = WriteWindowBytes();
+
+    clio::run::u64 done = 0;
+    clio::run::u64 cur = off;
+    while (done < count) {
+      const clio::run::u64 page_off = cur % kFsPageSize;
+      clio::run::u64 to_write = kFsPageSize - page_off;
+      if (to_write > count - done) {
+        to_write = count - done;
+      }
+      // AsyncPutBlobDefer owns a copy of the bytes, so `buf` may be reused the
+      // moment this returns -- which is what write(2) promises its caller and
+      // what makes the whole path safe without pinning the user's buffer.
+      const int rc = cte->AsyncPutBlobDefer(
+          tag_id, PageName(cur), page_off, to_write, src + done,
+          /*score*/ -1.0f, clio::cte::core::Context(), /*flags*/ 0u,
+          clio::run::PoolQuery::Dynamic(), wall);
+      if (rc != 0) {
+        // -2 is shared memory exhausted with nothing left to await; anything
+        // else is a degenerate request. Neither is retryable here.
+        errno = (rc == -2) ? ENOMEM : EIO;
+        return -1;
+      }
+      done += to_write;
+      cur += to_write;
+    }
+
+    // Publish the new logical size through the chimod, which owns it. Skipped
+    // entirely when the write cannot have grown the file -- an overwrite is
+    // most of a steady-state workload, and this is the only remaining RPC on
+    // the path.
+    const clio::run::u64 end = off + count;
+    if (end > rec.size_) {
+      auto fut = AsyncWrite(handle, end, 0, ctp::ipc::ShmPtr<>());
+      if (sync) {
+        fut.Wait();
+        if (fut->GetReturnCode() != 0) {
+          errno = EIO;
+          return -1;
+        }
+      } else {
+        DeferRegisterWrite(fut, FileKey(path), end, 0, nullptr,
+                           ctp::ipc::FullPtr<char>::GetNull(), 0);
+      }
+    }
+    if (sync) {
+      AwaitPutsUntilSpace(0);
+    }
+    return static_cast<ssize_t>(count);
+  }
+
   ssize_t Write(clio::run::u64 handle, const std::string &path,
                 clio::run::u64 off, const void *buf, size_t count,
                 bool sync = false) {
     if (count == 0) {
       return 0;
+    }
+    // Client-side first (issue #933). -2 means it cannot serve this request --
+    // no shm mirror, no tag, a directory, a pending append -- and the RPC below
+    // is the fallback, which is also what a remote client always gets.
+    if (ClientSideWriteEnabled()) {
+      const ssize_t r = WriteClientSide(handle, path, off, buf, count, sync);
+      if (r != -2) {
+        return r;
+      }
     }
     const bool blocking = sync || !AsyncWritesEnabled();
     // Recycle completed writes' staging so this burst feeds its own pool

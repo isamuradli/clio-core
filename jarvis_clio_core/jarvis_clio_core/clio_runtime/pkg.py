@@ -239,10 +239,13 @@ class ClioRuntime(Service):
         self.log(f"  Config file: {self.config_file}")
 
     def _generate_config(self):
-        if self.config['main_segment_size'] == 'auto':
-            main_size = 'auto'
-        else:
-            main_size = SizeType(self.config['main_segment_size']).bytes
+        # 'auto' is jarvis's way of saying "don't set it" -- the runtime has its
+        # own auto default (RAM-sized, then clamped to half the memory budget).
+        # Emit NOTHING in that case: ParseSegmentSizeText rejects the literal
+        # string 'auto'. This was invisible while these keys were written under
+        # a 'memory' section the runtime never parsed.
+        main_size = (None if self.config['main_segment_size'] == 'auto'
+                     else SizeType(self.config['main_segment_size']).bytes)
         client_size = SizeType(self.config['client_data_segment_size']).bytes
 
         # Prefer the hostfile copy that jarvis.pipeline.save() stamps into
@@ -276,7 +279,6 @@ class ClioRuntime(Service):
                 'file': f"{self.shared_dir}/clio_run.log"
             },
             'runtime': {
-                'main_segment_size': main_size,
                 'client_data_segment_size': client_size,
                 'num_threads': self.config['num_threads'],
                 'process_reaper_threads': self.config['process_reaper_workers'],
@@ -299,6 +301,9 @@ class ClioRuntime(Service):
                     self.config['swim_suspicion_timeout_sec'],
             }
         }
+
+        if main_size is not None:
+            config_dict['runtime']['main_segment_size'] = main_size
 
         with open(self.config_file, 'w') as f:
             f.write('# Clio Runtime Configuration\n\n')
