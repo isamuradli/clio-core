@@ -224,6 +224,33 @@ void ReportWriteStats() {
   }
 }
 
+// Use the client's DEFERRED RPC path (Client::Write / Client::Read) rather
+// than raw AsyncWrite().Wait() / AsyncRead().Wait().
+//
+// Client::Write submits the WriteTask and registers its future instead of
+// waiting on it, so write(2) returns as soon as the bytes are staged; a failure
+// is latched against the path and reported by flush/fsync/close, the same
+// discipline the kernel page cache uses. Client::Read is its counterpart and is
+// REQUIRED with it: bytes for a just-written region may still be in a pending
+// write's staging buffer, and Client::Read checks that first (DeferTryServe)
+// before the shm mirror and finally an RPC. Reading past it would return
+// pre-write bytes.
+//
+// Measured cost of the synchronous path, 4 KiB, 1 rank: 206 us in the handler
+// (90 us with runtime workers kept hot), against 2.3 us when the client does
+// not wait. That is one client->chimod->core round trip per 4 KiB write.
+//
+// Defaults ON. It is separate from coalescing so the two can be measured
+// apart: coalescing batches 256 writes into one RPC, this one stops blocking
+// on each RPC, and they are independent wins.
+bool DeferEnabled() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_CTE_FUSE_DEFER");
+    return e == nullptr || !(std::string(e) == "0" || std::string(e) == "false");
+  }();
+  return v;
+}
+
 bool CoalesceEnabled() {
   static const bool v = [] {
     // DEFAULT OFF (issue #933). Routing writes through Client::Write's pooled
@@ -969,10 +996,11 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
   // read must push them out first -- including buffers held by OTHER handles
   // on this file, which is why the registry exists.
   auto *cfs = CLIO_CFS_CLIENT;
-  if (CoalesceEnabled()) {
-    // Only the buffering path can hide bytes from the client, and only then is
-    // Client::Read's in-flight-staging tier needed for read-your-own-writes.
-    FlushPathBuffers(handle->path);
+  if (CoalesceEnabled() || DeferEnabled()) {
+    // Either path can leave bytes the chimod has not seen -- buffered here, or
+    // in a pending write's staging -- so the read must go through
+    // Client::Read, whose first tier serves exactly those.
+    if (CoalesceEnabled()) FlushPathBuffers(handle->path);
     const ssize_t got = cfs->Read(handle->fh, handle->path,
                                   static_cast<clio::run::u64>(offset), buf,
                                   size);
@@ -1118,12 +1146,13 @@ static int cte_fuse_write_inner(const char *path, const char *buf, size_t size,
     const int rc = FlushLocked(handle);
     if (rc != 0) return rc;
   }
-  // Raw AsyncWrite, NOT Client::Write. This is the measured-good path: routing
-  // through Client::Write's pooled staging fails at 8 concurrent ranks with
-  // EIO, and buys nothing -- 4 KiB writes measured 14-17 MiB/s through it at
-  // 1 rank, indistinguishable from this path, because ~98% of a small write is
-  // the kernel round trip (5 us in this handler against a ~300 us gap between
-  // upcalls) rather than anything the submit path does.
+  if (DeferEnabled()) {
+    // Deferred RPC: submit and return, do not wait on the future.
+    const ssize_t written = cfs->Write(handle->fh, handle->path, off, buf,
+                                       size, sync);
+    return (written < 0) ? -errno : static_cast<int>(written);
+  }
+  // Fully synchronous fallback: one client->chimod->core round trip per write.
   auto *ipc = CLIO_IPC;
   ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
   if (shm_buf.IsNull()) return -ENOMEM;
