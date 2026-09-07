@@ -126,7 +126,20 @@ struct NeuroPressGpuWeights {
   float d5_clamped[kMaxSamples][kOutputDim];
   float d5_raw[kMaxSamples][kOutputDim];
   float combined[kParamCount];
-  float out_grad[kParamCount];
+  // ONE GRADIENT SLICE PER OUTPUT HEAD, so the eight backward passes can run
+  // as eight blocks instead of eight loop iterations in one. 424 KB against a
+  // measured 73% of the SGD kernel; see SgdPerOutputKernel. AdaptiveSGDKernel
+  // needs a single flat scratch vector and uses slice 0.
+  float out_grad[kOutputDim][kParamCount];
+  /* Each head's clipped step size, handed to phase C so the scale and the
+     accumulate stay ONE fused multiply-add, as they were when both lived in
+     the same statement. See SgdApplyKernel. */
+  float lr_head[kOutputDim];
+  /* Scalars and per-sample maxima carried between the phases of the update
+     step, which used to be locals inside one kernel. */
+  float sgd_step;
+  float sgd_g_norm;
+  float dy_sample[kMaxSamples];
   // One slot per SAMPLE, not one shared slot rebuilt per target output: see
   // the hoist in SGDKernel. 16 KB, against the 8 KB the removed act_z arrays
   // gave back and the kOutputDim-fold duplicate work it retires.
@@ -1829,24 +1842,19 @@ __device__ __forceinline__ void SgdForwardAndErrors(
 
 }
 
-__global__ void SGDKernel(NeuroPressGpuWeights *w,
-                          const NeuroPressGpuSGDSample *__restrict__ samples,
-                          int num_samples, float learning_rate,
-                          float *__restrict__ ema, bool *out_applied,
-                          const ctp::DeviceFeatureStats *__restrict__
-                              device_stats,
-                          float out_delta) {
+/**
+ * SGD phase A: forward pass, per-head errors, uncertainty weighting, and the
+ * normalized L4 deltas. One block -- this part is inherently sequential over
+ * samples and layers.
+ */
+__global__ void SgdPrepareKernel(
+    NeuroPressGpuWeights *w,
+    const NeuroPressGpuSGDSample *__restrict__ samples, int num_samples,
+    const ctp::DeviceFeatureStats *__restrict__ device_stats) {
   int t = threadIdx.x;  // 0..63
   __shared__ float s_reduce[kHiddenDim];
 
   SgdForwardAndErrors(w, samples, num_samples, t, device_stats);
-
-  // ---- Phase 2: per-output backward passes with PCGrad-lite ----
-  constexpr float kGradClipThreshold = 0.1f;
-  constexpr float kPcgradCosThresh = -0.1f;
-
-  for (int i = t; i < kParamCount; i += kHiddenDim) w->combined[i] = 0.0f;
-  __syncthreads();
 
   // ---- Step 1, once per sample: L4 backward delta for ALL outputs,
   // normalized to unit vectors.
@@ -1883,153 +1891,294 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
     }
   }
 
-  for (int target_out = 0; target_out < kOutputDim; ++target_out) {
-    for (int i = t; i < kParamCount; i += kHiddenDim) w->out_grad[i] = 0.0f;
-    __syncthreads();
+}
 
-    for (int si = 0; si < num_samples; ++si) {
-      // Step 2: PCGrad projection for target_out against every other output.
-      // Step 1 (the normalized L4 deltas) was hoisted above the target_out
-      // loop -- it does not depend on target_out.
-      float my_dz4 = w->dz4_all[si][target_out][t];
-      for (int j = 0; j < kOutputDim; ++j) {
-        if (j == target_out) continue;
-        float local_dot = my_dz4 * w->dz4_all[si][j][t];
-        s_reduce[t] = local_dot;
-        __syncthreads();
-        for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
-          if (t < s) s_reduce[t] += s_reduce[t + s];
-          __syncthreads();
-        }
-        float cos_ij = s_reduce[0];
-        if (cos_ij < kPcgradCosThresh) my_dz4 -= cos_ij * w->dz4_all[si][j][t];
+/**
+ * SGD phase B: ONE BLOCK PER OUTPUT HEAD.
+ *
+ * This was `for (target_out = 0; target_out < kOutputDim; ++target_out)` inside
+ * the single-block kernel, and it measured 73% of the SGD cost: eight
+ * sequential passes over all 13576 parameters in one block of 64 threads --
+ * one of the A100's 108 SMs.
+ *
+ * The eight are INDEPENDENT. Each zeroes its own gradient buffer, accumulates
+ * over the samples, computes its own norm and clip scale, and scales by its
+ * own lr_out. Everything they read -- params, act_x, act_h1..h4, d5_clamped,
+ * dz4_all -- is written before this kernel and not touched again until phase
+ * C, so no head can observe another's work. params in particular is read-only
+ * until the update in phase C. The ONLY coupling was the final
+ * `combined[i] += lr_out * out_grad[i]`.
+ *
+ * So each head writes its own `out_grad[target_out]` slice, already scaled by
+ * lr_out, and phase C sums the eight IN ASCENDING ORDER. Float addition is not
+ * associative, so that order is exactly what must be preserved -- and it is,
+ * which is why this is bit-identical rather than merely close. Entries a head
+ * does not own keep the zero this kernel wrote, and adding an exact zero
+ * changes no float value, at +-0, at +-inf or at NaN.
+ */
+__global__ void SgdPerOutputKernel(NeuroPressGpuWeights *w, int num_samples,
+                                   float learning_rate) {
+  const int target_out = static_cast<int>(blockIdx.x);
+  const int t = static_cast<int>(threadIdx.x);
+  __shared__ float s_reduce[kHiddenDim];
+  float *__restrict__ og = w->out_grad[target_out];
+
+  constexpr float kGradClipThreshold = 0.1f;
+  constexpr float kPcgradCosThresh = -0.1f;
+
+  for (int i = t; i < kParamCount; i += kHiddenDim) og[i] = 0.0f;
+  __syncthreads();
+
+  for (int si = 0; si < num_samples; ++si) {
+    // Step 2: PCGrad projection for target_out against every other output.
+    // Step 1 (the normalized L4 deltas) was hoisted above the target_out
+    // loop -- it does not depend on target_out.
+    float my_dz4 = w->dz4_all[si][target_out][t];
+    for (int j = 0; j < kOutputDim; ++j) {
+      if (j == target_out) continue;
+      float local_dot = my_dz4 * w->dz4_all[si][j][t];
+      s_reduce[t] = local_dot;
+      __syncthreads();
+      for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
+        if (t < s) s_reduce[t] += s_reduce[t + s];
         __syncthreads();
       }
-      float err_mag = fabsf(w->d5_clamped[si][target_out]);
-      float dz4 = my_dz4 * err_mag;
-
-      // Step 3: W5/b5 gradient uses the ORIGINAL (unprojected) error.
-      float error_signal = w->d5_clamped[si][target_out];
-      w->out_grad[kOffW5 + target_out * kHiddenDim + t] +=
-          error_signal * w->act_h4[si][t];
-      if (t == 0) w->out_grad[kOffB5 + target_out] += error_signal;
-
-      // Step 4/4b: L4 gradient, backward L4->L3 (using PROJECTED dz4).
-      for (int i = 0; i < kHiddenDim; ++i)
-        w->out_grad[kOffW4 + t * kHiddenDim + i] += dz4 * w->act_h3[si][i];
-      w->out_grad[kOffB4 + t] += dz4;
-
-      // Broadcast dz4[0..63] through shared memory so every thread can sum
-      // weights_[*, t] * dz4[*] for the L4->L3 backward step.
-      __shared__ float s_dz4[kHiddenDim];
-      s_dz4[t] = dz4;
+      float cos_ij = s_reduce[0];
+      if (cos_ij < kPcgradCosThresh) my_dz4 -= cos_ij * w->dz4_all[si][j][t];
       __syncthreads();
-      float dh3_t = 0.0f;
-      for (int j = 0; j < kHiddenDim; ++j)
-        dh3_t += w->params[kOffW4 + j * kHiddenDim + t] * s_dz4[j];
-      float dz3 = (w->act_h3[si][t] > 0.0f) ? dh3_t : 0.0f;
+    }
+    float err_mag = fabsf(w->d5_clamped[si][target_out]);
+    float dz4 = my_dz4 * err_mag;
 
-      // Step 5/5b: L3 gradient, backward L3->L2.
-      for (int i = 0; i < kHiddenDim; ++i)
-        w->out_grad[kOffW3 + t * kHiddenDim + i] += dz3 * w->act_h2[si][i];
-      w->out_grad[kOffB3 + t] += dz3;
-      __shared__ float s_dz3[kHiddenDim];
-      s_dz3[t] = dz3;
-      __syncthreads();
-      float dh2_t = 0.0f;
-      for (int j = 0; j < kHiddenDim; ++j)
-        dh2_t += w->params[kOffW3 + j * kHiddenDim + t] * s_dz3[j];
-      float dz2 = (w->act_h2[si][t] > 0.0f) ? dh2_t : 0.0f;
+    // Step 3: W5/b5 gradient uses the ORIGINAL (unprojected) error.
+    float error_signal = w->d5_clamped[si][target_out];
+    og[kOffW5 + target_out * kHiddenDim + t] +=
+        error_signal * w->act_h4[si][t];
+    if (t == 0) og[kOffB5 + target_out] += error_signal;
 
-      // Step 6/6b: L2 gradient, backward L2->L1, then L1 gradient.
-      for (int i = 0; i < kHiddenDim; ++i)
-        w->out_grad[kOffW2 + t * kHiddenDim + i] += dz2 * w->act_h1[si][i];
-      w->out_grad[kOffB2 + t] += dz2;
-      __shared__ float s_dz2[kHiddenDim];
-      s_dz2[t] = dz2;
-      __syncthreads();
-      float dh1_t = 0.0f;
-      for (int j = 0; j < kHiddenDim; ++j)
-        dh1_t += w->params[kOffW2 + j * kHiddenDim + t] * s_dz2[j];
-      float dz1 = (w->act_h1[si][t] > 0.0f) ? dh1_t : 0.0f;
+    // Step 4/4b: L4 gradient, backward L4->L3 (using PROJECTED dz4).
+    for (int i = 0; i < kHiddenDim; ++i)
+      og[kOffW4 + t * kHiddenDim + i] += dz4 * w->act_h3[si][i];
+    og[kOffB4 + t] += dz4;
 
-      for (int i = 0; i < kInputDim; ++i)
-        w->out_grad[kOffW1 + t * kInputDim + i] += dz1 * w->act_x[si][i];
-      w->out_grad[kOffB1 + t] += dz1;
-      __syncthreads();
-    }  // per-sample
-
-    // Average over samples, compute this output's gradient norm (only the
-    // params it actually touches: shared L1-L4 + its own W5/b5 row).
-    float inv_n = 1.0f / static_cast<float>(num_samples);
-    float local_norm_sq = 0.0f;
-    for (int i = 0; i < kInputDim; ++i) {
-      int idx = kOffW1 + t * kInputDim + i;
-      w->out_grad[idx] *= inv_n;
-      local_norm_sq += w->out_grad[idx] * w->out_grad[idx];
-    }
-    { int idx = kOffB1 + t; w->out_grad[idx] *= inv_n; local_norm_sq += w->out_grad[idx] * w->out_grad[idx]; }
-    for (int i = 0; i < kHiddenDim; ++i) {
-      int idx = kOffW2 + t * kHiddenDim + i;
-      w->out_grad[idx] *= inv_n;
-      local_norm_sq += w->out_grad[idx] * w->out_grad[idx];
-    }
-    { int idx = kOffB2 + t; w->out_grad[idx] *= inv_n; local_norm_sq += w->out_grad[idx] * w->out_grad[idx]; }
-    for (int i = 0; i < kHiddenDim; ++i) {
-      int idx = kOffW3 + t * kHiddenDim + i;
-      w->out_grad[idx] *= inv_n;
-      local_norm_sq += w->out_grad[idx] * w->out_grad[idx];
-    }
-    { int idx = kOffB3 + t; w->out_grad[idx] *= inv_n; local_norm_sq += w->out_grad[idx] * w->out_grad[idx]; }
-    for (int i = 0; i < kHiddenDim; ++i) {
-      int idx = kOffW4 + t * kHiddenDim + i;
-      w->out_grad[idx] *= inv_n;
-      local_norm_sq += w->out_grad[idx] * w->out_grad[idx];
-    }
-    { int idx = kOffB4 + t; w->out_grad[idx] *= inv_n; local_norm_sq += w->out_grad[idx] * w->out_grad[idx]; }
-    {
-      int idx = kOffW5 + target_out * kHiddenDim + t;
-      w->out_grad[idx] *= inv_n;
-      local_norm_sq += w->out_grad[idx] * w->out_grad[idx];
-    }
-    if (t == target_out) {
-      int idx = kOffB5 + target_out;
-      w->out_grad[idx] *= inv_n;
-      local_norm_sq += w->out_grad[idx] * w->out_grad[idx];
-    }
-
-    s_reduce[t] = local_norm_sq;
+    // Broadcast dz4[0..63] through shared memory so every thread can sum
+    // weights_[*, t] * dz4[*] for the L4->L3 backward step.
+    __shared__ float s_dz4[kHiddenDim];
+    s_dz4[t] = dz4;
     __syncthreads();
-    for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
-      if (t < s) s_reduce[t] += s_reduce[t + s];
-      __syncthreads();
-    }
-    float out_norm = sqrtf(s_reduce[0]) + 1e-8f;
-    float clip_scale = (out_norm > kGradClipThreshold) ? (kGradClipThreshold / out_norm) : 1.0f;
-    float lr_out = learning_rate * clip_scale;
+    float dh3_t = 0.0f;
+    for (int j = 0; j < kHiddenDim; ++j)
+      dh3_t += w->params[kOffW4 + j * kHiddenDim + t] * s_dz4[j];
+    float dz3 = (w->act_h3[si][t] > 0.0f) ? dh3_t : 0.0f;
+
+    // Step 5/5b: L3 gradient, backward L3->L2.
+    for (int i = 0; i < kHiddenDim; ++i)
+      og[kOffW3 + t * kHiddenDim + i] += dz3 * w->act_h2[si][i];
+    og[kOffB3 + t] += dz3;
+    __shared__ float s_dz3[kHiddenDim];
+    s_dz3[t] = dz3;
+    __syncthreads();
+    float dh2_t = 0.0f;
+    for (int j = 0; j < kHiddenDim; ++j)
+      dh2_t += w->params[kOffW3 + j * kHiddenDim + t] * s_dz3[j];
+    float dz2 = (w->act_h2[si][t] > 0.0f) ? dh2_t : 0.0f;
+
+    // Step 6/6b: L2 gradient, backward L2->L1, then L1 gradient.
+    for (int i = 0; i < kHiddenDim; ++i)
+      og[kOffW2 + t * kHiddenDim + i] += dz2 * w->act_h1[si][i];
+    og[kOffB2 + t] += dz2;
+    __shared__ float s_dz2[kHiddenDim];
+    s_dz2[t] = dz2;
+    __syncthreads();
+    float dh1_t = 0.0f;
+    for (int j = 0; j < kHiddenDim; ++j)
+      dh1_t += w->params[kOffW2 + j * kHiddenDim + t] * s_dz2[j];
+    float dz1 = (w->act_h1[si][t] > 0.0f) ? dh1_t : 0.0f;
 
     for (int i = 0; i < kInputDim; ++i)
-      w->combined[kOffW1 + t * kInputDim + i] += lr_out * w->out_grad[kOffW1 + t * kInputDim + i];
-    w->combined[kOffB1 + t] += lr_out * w->out_grad[kOffB1 + t];
+      og[kOffW1 + t * kInputDim + i] += dz1 * w->act_x[si][i];
+    og[kOffB1 + t] += dz1;
+    __syncthreads();
+  }  // per-sample
+
+  // Average over samples, compute this output's gradient norm (only the
+  // params it actually touches: shared L1-L4 + its own W5/b5 row).
+  float inv_n = 1.0f / static_cast<float>(num_samples);
+  float local_norm_sq = 0.0f;
+  for (int i = 0; i < kInputDim; ++i) {
+    int idx = kOffW1 + t * kInputDim + i;
+    og[idx] *= inv_n;
+    local_norm_sq += og[idx] * og[idx];
+  }
+  { int idx = kOffB1 + t; og[idx] *= inv_n; local_norm_sq += og[idx] * og[idx]; }
+  for (int i = 0; i < kHiddenDim; ++i) {
+    int idx = kOffW2 + t * kHiddenDim + i;
+    og[idx] *= inv_n;
+    local_norm_sq += og[idx] * og[idx];
+  }
+  { int idx = kOffB2 + t; og[idx] *= inv_n; local_norm_sq += og[idx] * og[idx]; }
+  for (int i = 0; i < kHiddenDim; ++i) {
+    int idx = kOffW3 + t * kHiddenDim + i;
+    og[idx] *= inv_n;
+    local_norm_sq += og[idx] * og[idx];
+  }
+  { int idx = kOffB3 + t; og[idx] *= inv_n; local_norm_sq += og[idx] * og[idx]; }
+  for (int i = 0; i < kHiddenDim; ++i) {
+    int idx = kOffW4 + t * kHiddenDim + i;
+    og[idx] *= inv_n;
+    local_norm_sq += og[idx] * og[idx];
+  }
+  { int idx = kOffB4 + t; og[idx] *= inv_n; local_norm_sq += og[idx] * og[idx]; }
+  {
+    int idx = kOffW5 + target_out * kHiddenDim + t;
+    og[idx] *= inv_n;
+    local_norm_sq += og[idx] * og[idx];
+  }
+  if (t == target_out) {
+    int idx = kOffB5 + target_out;
+    og[idx] *= inv_n;
+    local_norm_sq += og[idx] * og[idx];
+  }
+
+  s_reduce[t] = local_norm_sq;
+  __syncthreads();
+  for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
+    if (t < s) s_reduce[t] += s_reduce[t + s];
+    __syncthreads();
+  }
+  float out_norm = sqrtf(s_reduce[0]) + 1e-8f;
+  float clip_scale = (out_norm > kGradClipThreshold) ? (kGradClipThreshold / out_norm) : 1.0f;
+  float lr_out = learning_rate * clip_scale;
+
+  /* The gradient is left UNSCALED and lr_out is published for phase C.
+     Scaling here and adding there would be two roundings where the original
+     `combined[idx] += lr_out * out_grad[idx]` is one -- nvcc contracts that
+     statement into a single FMA. Splitting the kernel must not split the
+     contraction; measured, doing so moved the trained weights in the last
+     float32 ULP and every prediction after them. */
+  if (t == 0) w->lr_head[target_out] = lr_out;
+  __syncthreads();
+}
+
+/**
+ * The output-space trust region, ONE BLOCK PER SAMPLE.
+ *
+ * It walks four layers of forward-mode tangents per sample and cost 0.124 ms
+ * -- a quarter of what SGD spends -- as a sequential loop over samples inside
+ * the apply kernel's single block.
+ *
+ * Samples are independent: sample si reads only ema, params, act_x[si],
+ * act_h1..4[si] and d5_raw[si], all read-only here, and contributes one
+ * number. The result is a MAXIMUM over every (sample, head) pair, and a
+ * maximum does not care how the set is bracketed -- so taking the per-sample
+ * maximum in its own block and folding the eight afterwards is the same value.
+ * NaN cannot enter: dy_local starts at 0 and fmaxf(0, NaN) is 0, so every
+ * value in the tree is a real number and the order is irrelevant, not merely
+ * usually irrelevant.
+ */
+__global__ void SgdTrustKernel(NeuroPressGpuWeights *w, int num_samples,
+                               const float *__restrict__ ema) {
+  const int si = static_cast<int>(blockIdx.x);
+  const int t = static_cast<int>(threadIdx.x);
+  __shared__ float s_reduce[kHiddenDim];
+  if (si >= num_samples) {
+    // Not a sample this call carries: publish the neutral element so the fold
+    // below can read a fixed-width array.
+    if (t == 0) w->dy_sample[si] = 0.0f;
+    return;
+  }
+  __shared__ float s_tan_a[kHiddenDim];
+  __shared__ float s_tan_b[kHiddenDim];
+  float dy_local = 0.0f;
+  {
+    // L1: dz1 = dW1 x + db1. The input is fixed, so there is no dx term.
+    float dz = ema[kOffB1 + t];
+    for (int i = 0; i < kInputDim; ++i)
+      dz += ema[kOffW1 + t * kInputDim + i] * w->act_x[si][i];
+    s_tan_a[t] = (w->act_h1[si][t] > 0.0f) ? dz : 0.0f;
+    __syncthreads();
+    // L2: dz2 = dW2 h1 + W2 dh1 + db2, and likewise below.
+    dz = ema[kOffB2 + t];
     for (int i = 0; i < kHiddenDim; ++i)
-      w->combined[kOffW2 + t * kHiddenDim + i] += lr_out * w->out_grad[kOffW2 + t * kHiddenDim + i];
-    w->combined[kOffB2 + t] += lr_out * w->out_grad[kOffB2 + t];
+      dz += ema[kOffW2 + t * kHiddenDim + i] * w->act_h1[si][i] +
+            w->params[kOffW2 + t * kHiddenDim + i] * s_tan_a[i];
+    s_tan_b[t] = (w->act_h2[si][t] > 0.0f) ? dz : 0.0f;
+    __syncthreads();
+    dz = ema[kOffB3 + t];
     for (int i = 0; i < kHiddenDim; ++i)
-      w->combined[kOffW3 + t * kHiddenDim + i] += lr_out * w->out_grad[kOffW3 + t * kHiddenDim + i];
-    w->combined[kOffB3 + t] += lr_out * w->out_grad[kOffB3 + t];
+      dz += ema[kOffW3 + t * kHiddenDim + i] * w->act_h2[si][i] +
+            w->params[kOffW3 + t * kHiddenDim + i] * s_tan_b[i];
+    s_tan_a[t] = (w->act_h3[si][t] > 0.0f) ? dz : 0.0f;
+    __syncthreads();
+    dz = ema[kOffB4 + t];
     for (int i = 0; i < kHiddenDim; ++i)
-      w->combined[kOffW4 + t * kHiddenDim + i] += lr_out * w->out_grad[kOffW4 + t * kHiddenDim + i];
-    w->combined[kOffB4 + t] += lr_out * w->out_grad[kOffB4 + t];
-    {
-      int idx = kOffW5 + target_out * kHiddenDim + t;
-      w->combined[idx] += lr_out * w->out_grad[idx];
-    }
-    if (t == target_out) {
-      int idx = kOffB5 + target_out;
-      w->combined[idx] += lr_out * w->out_grad[idx];
+      dz += ema[kOffW4 + t * kHiddenDim + i] * w->act_h3[si][i] +
+            w->params[kOffW4 + t * kHiddenDim + i] * s_tan_a[i];
+    s_tan_b[t] = (w->act_h4[si][t] > 0.0f) ? dz : 0.0f;
+    __syncthreads();
+    // Heads 0..3, only where this sample carried an error for that head.
+    if (t < 4 && w->d5_raw[si][t] != 0.0f) {
+      float dy = 0.0f;
+      for (int i = 0; i < kHiddenDim; ++i) {
+        dy += w->params[kOffW5 + t * kHiddenDim + i] * s_tan_b[i];
+        if (t != 1) dy += ema[kOffW5 + t * kHiddenDim + i] * w->act_h4[si][i];
+      }
+      if (t != 1) dy += ema[kOffB5 + t];
+      dy_local = fmaxf(dy_local, fabsf(dy));
     }
     __syncthreads();
-  }  // per target_out
+  }
+  s_reduce[t] = dy_local;
+  __syncthreads();
+  for (int s2 = kHiddenDim / 2; s2 > 0; s2 >>= 1) {
+    if (t < s2) s_reduce[t] = fmaxf(s_reduce[t], s_reduce[t + s2]);
+    __syncthreads();
+  }
+  if (t == 0) w->dy_sample[si] = s_reduce[0];
+}
+
+/**
+ * The ordered fold of the eight per-head gradients, on a full grid.
+ *
+ * `combined` used to be zeroed and then accumulated into once per head, in
+ * ascending head order; this reproduces that sequence exactly. Every index is
+ * covered -- the trunk by all eight heads, W5 row r and b5[r] by head r alone
+ * -- so assigning is equivalent to zero-then-add.
+ *
+ * Each output index is INDEPENDENT: `acc` never crosses lanes. It ran on the
+ * 64 threads of the apply kernel, 212 strided iterations of 8 FMAs each,
+ * measured at 0.076 ms; a full grid does the same arithmetic per index with
+ * one thread per index.
+ *
+ * __fmaf_rn, not `acc += lr * g`: the statement this descends from was a
+ * single contracted FMA per head (nvcc defaults to -fmad=1), and the fold has
+ * to be the same instruction in the same order or the last ULP moves. A head
+ * that does not own index i left out_grad at exactly 0, and fma(lr, 0, acc)
+ * == acc for every finite lr -- which lr_out always is, since clip_scale is
+ * 1.0 when the norm is NaN and 0 when it is infinite.
+ */
+__global__ void SgdFoldKernel(NeuroPressGpuWeights *w) {
+  const int stride = static_cast<int>(gridDim.x * blockDim.x);
+  for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+       i < kParamCount; i += stride) {
+    float acc = 0.0f;
+    for (int b = 0; b < kOutputDim; ++b) {
+      acc = __fmaf_rn(w->lr_head[b], w->out_grad[b][i], acc);
+    }
+    w->combined[i] = acc;
+  }
+}
+
+/**
+ * SGD phase C: fold the eight per-head gradients together, then the
+ * trust-region step, anti-flip damping, EMA smoothing and weight update --
+ * all exactly as before.
+ */
+__global__ void SgdApplyKernel(NeuroPressGpuWeights *w, int num_samples,
+                               float *__restrict__ ema, float out_delta) {
+  int t = threadIdx.x;  // 0..63
+  __shared__ float s_reduce[kHiddenDim];
+
 
   // ---- Trust-region step, anti-flip damping, EMA smoothing, weight update ----
   constexpr float kEmaDecay = 0.85f;
@@ -2128,56 +2277,35 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
   // is nearly inert; on the inputs above it shrinks the step ~14x, which is
   // what descent needs there. Row 1 of W5 and b5[1] are withheld from the
   // update below, so head 1's tangent carries the trunk term only.
+  // Hand the two scalars the remaining phases need across the kernel
+  // boundary. `step` is the trust-region step BEFORE the output-space bound;
+  // SgdStepKernel applies that bound, from the per-sample maxima
+  // SgdTrustKernel computes in parallel.
+  if (t == 0) {
+    w->sgd_step = step;
+    w->sgd_g_norm = g_norm;
+  }
+}
+
+/**
+ * Fold the per-sample maxima, apply the output-space bound, and take the step.
+ * One block, as the update itself always was.
+ */
+__global__ void SgdStepKernel(NeuroPressGpuWeights *w, bool *out_applied,
+                              float out_delta,
+                              const float *__restrict__ ema) {
+  constexpr float kWClamp = 10.0f;
+  const int t = static_cast<int>(threadIdx.x);
+  float step = w->sgd_step;
+  const float g_norm = w->sgd_g_norm;
+
   if (out_delta > 0.0f) {
-    __shared__ float s_tan_a[kHiddenDim];
-    __shared__ float s_tan_b[kHiddenDim];
-    float dy_local = 0.0f;
-    for (int si = 0; si < num_samples; ++si) {
-      // L1: dz1 = dW1 x + db1. The input is fixed, so there is no dx term.
-      float dz = ema[kOffB1 + t];
-      for (int i = 0; i < kInputDim; ++i)
-        dz += ema[kOffW1 + t * kInputDim + i] * w->act_x[si][i];
-      s_tan_a[t] = (w->act_h1[si][t] > 0.0f) ? dz : 0.0f;
-      __syncthreads();
-      // L2: dz2 = dW2 h1 + W2 dh1 + db2, and likewise below.
-      dz = ema[kOffB2 + t];
-      for (int i = 0; i < kHiddenDim; ++i)
-        dz += ema[kOffW2 + t * kHiddenDim + i] * w->act_h1[si][i] +
-              w->params[kOffW2 + t * kHiddenDim + i] * s_tan_a[i];
-      s_tan_b[t] = (w->act_h2[si][t] > 0.0f) ? dz : 0.0f;
-      __syncthreads();
-      dz = ema[kOffB3 + t];
-      for (int i = 0; i < kHiddenDim; ++i)
-        dz += ema[kOffW3 + t * kHiddenDim + i] * w->act_h2[si][i] +
-              w->params[kOffW3 + t * kHiddenDim + i] * s_tan_b[i];
-      s_tan_a[t] = (w->act_h3[si][t] > 0.0f) ? dz : 0.0f;
-      __syncthreads();
-      dz = ema[kOffB4 + t];
-      for (int i = 0; i < kHiddenDim; ++i)
-        dz += ema[kOffW4 + t * kHiddenDim + i] * w->act_h3[si][i] +
-              w->params[kOffW4 + t * kHiddenDim + i] * s_tan_a[i];
-      s_tan_b[t] = (w->act_h4[si][t] > 0.0f) ? dz : 0.0f;
-      __syncthreads();
-      // Heads 0..3, only where this sample carried an error for that head.
-      if (t < 4 && w->d5_raw[si][t] != 0.0f) {
-        float dy = 0.0f;
-        for (int i = 0; i < kHiddenDim; ++i) {
-          dy += w->params[kOffW5 + t * kHiddenDim + i] * s_tan_b[i];
-          if (t != 1) dy += ema[kOffW5 + t * kHiddenDim + i] * w->act_h4[si][i];
-        }
-        if (t != 1) dy += ema[kOffB5 + t];
-        dy_local = fmaxf(dy_local, fabsf(dy));
-      }
-      __syncthreads();
+    // The same maximum over the same set, bracketed per sample instead of per
+    // thread. Ascending sample order, though max does not need it.
+    float dy_max = 0.0f;
+    for (int si = 0; si < kMaxSamples; ++si) {
+      dy_max = fmaxf(dy_max, w->dy_sample[si]);
     }
-    s_reduce[t] = dy_local;
-    __syncthreads();
-    for (int s2 = kHiddenDim / 2; s2 > 0; s2 >>= 1) {
-      if (t < s2) s_reduce[t] = fmaxf(s_reduce[t], s_reduce[t + s2]);
-      __syncthreads();
-    }
-    const float dy_max = s_reduce[0];
-    __syncthreads();
     // params -= step * ema, so a head moves by about step * dy_max.
     if (isfinite(dy_max) && dy_max * step > out_delta) step = out_delta / dy_max;
   }
@@ -2203,6 +2331,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
   }
   if (t == 0) *out_applied = finite_ok;
 }
+
 
 /** Block-wide sum of one float per thread; every thread gets the total. */
 __device__ __forceinline__ float BlockSum(float *s_reduce, int t, float v) {
@@ -2326,7 +2455,7 @@ __global__ void AdaptiveSGDKernel(
     } else {
       d = trunk_on ? lr * o.trunk_scale * ema[i] : 0.0f;
     }
-    w->out_grad[i] = d;
+    w->out_grad[0][i] = d;
     step_sq += d * d;
   }
   const float step_norm = sqrtf(BlockSum(s_reduce, t, step_sq));
@@ -2340,7 +2469,7 @@ __global__ void AdaptiveSGDKernel(
   if (finite_ok) {
     constexpr float kWClamp = 10.0f;
     for (int i = t; i < kParamCount; i += kHiddenDim) {
-      const float pv = w->params[i] - scale * w->out_grad[i];
+      const float pv = w->params[i] - scale * w->out_grad[0][i];
       w->params[i] = fmaxf(-kWClamp, fminf(kWClamp, pv));
     }
   }
@@ -2423,9 +2552,28 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
         w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
         num_samples, lr, ema, d_applied, d_stats, opt);
   } else {
-    SGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
+    /* Three launches where there was one, all on the SGD stream, so they
+       chain on the device exactly as the three phases chained inside the
+       single kernel -- the stream IS the barrier that `__syncthreads` used to
+       be between them. Still fire-and-forget: nothing is waited on here.
+       Two extra launches cost ~6 us against the ~2.2 ms the widened phase B
+       removes. */
+    SgdPrepareKernel<<<1, kHiddenDim, 0, g.stream>>>(
         w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
-        num_samples, lr, ema, d_applied, d_stats, opt.out_delta);
+        num_samples, d_stats);
+    SgdPerOutputKernel<<<kOutputDim, kHiddenDim, 0, g.stream>>>(
+        w, num_samples, lr);
+    constexpr int kFoldBlock = 256;
+    SgdFoldKernel<<<(kParamCount + kFoldBlock - 1) / kFoldBlock, kFoldBlock, 0,
+                    g.stream>>>(w);
+    SgdApplyKernel<<<1, kHiddenDim, 0, g.stream>>>(
+        w, num_samples, ema, opt.out_delta);
+    if (opt.out_delta > 0.0f) {
+      SgdTrustKernel<<<kMaxSamples, kHiddenDim, 0, g.stream>>>(w, num_samples,
+                                                               ema);
+    }
+    SgdStepKernel<<<1, kHiddenDim, 0, g.stream>>>(w, d_applied, opt.out_delta,
+                                                  ema);
   }
   if (cudaGetLastError() != cudaSuccess) return false;
 
