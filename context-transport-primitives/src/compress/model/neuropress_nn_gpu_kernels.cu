@@ -112,16 +112,25 @@ struct NeuroPressGpuWeights {
 
   // Persistent scratch for Train() -- avoids per-call cudaMalloc.
   float act_x[kMaxSamples][kInputDim];
-  float act_z1[kMaxSamples][kHiddenDim], act_h1[kMaxSamples][kHiddenDim];
-  float act_z2[kMaxSamples][kHiddenDim], act_h2[kMaxSamples][kHiddenDim];
-  float act_z3[kMaxSamples][kHiddenDim], act_h3[kMaxSamples][kHiddenDim];
-  float act_z4[kMaxSamples][kHiddenDim], act_h4[kMaxSamples][kHiddenDim];
+  // Only the post-ReLU activations are kept. The pre-activations z were
+  // stored beside them and read back for exactly one purpose -- the ReLU
+  // derivative, as `z > 0` -- and h = fmaxf(0, z) answers that identically
+  // for every float: h > 0 exactly when z > 0, including at +-0 (both
+  // false), at +-inf (true / false) and at NaN, where fmaxf returns the
+  // non-NaN operand 0 and both tests are false. Two arrays held one fact.
+  float act_h1[kMaxSamples][kHiddenDim];
+  float act_h2[kMaxSamples][kHiddenDim];
+  float act_h3[kMaxSamples][kHiddenDim];
+  float act_h4[kMaxSamples][kHiddenDim];
   float act_y[kMaxSamples][kOutputDim];
   float d5_clamped[kMaxSamples][kOutputDim];
   float d5_raw[kMaxSamples][kOutputDim];
   float combined[kParamCount];
   float out_grad[kParamCount];
-  float dz4_all[kOutputDim][kHiddenDim];
+  // One slot per SAMPLE, not one shared slot rebuilt per target output: see
+  // the hoist in SGDKernel. 16 KB, against the 8 KB the removed act_z arrays
+  // gave back and the kOutputDim-fold duplicate work it retires.
+  float dz4_all[kMaxSamples][kOutputDim][kHiddenDim];
 };
 
 namespace {
@@ -379,7 +388,7 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   // (nn_gpu.cu copies the entire NNWeightsGPU in one call).
   //
   // Clio cannot copy the WHOLE struct the way upstream does: ours also carries
-  // the persistent Train() scratch (act_x, act_z1..., d5_clamped), which is
+  // the persistent Train() scratch (act_x, act_h1..., d5_clamped), which is
   // device-only and must not be uploaded. Upstream keeps its SGD scratch per
   // CompContext instead, which is why its struct is copyable wholesale. The
   // prefix is exactly the part that is model data.
@@ -1356,11 +1365,15 @@ bool FetchPredictionsSync(InferScratch &s, int n, cudaStream_t st,
       std::memcpy(out_scores, base, sizeof(double) * nn);
     }
   }
+  // The first four are null-checked like the last four: the all-outputs entry
+  // point documents that ANY out_* may be null, and it shares this function.
+  // Every ranking caller passes all four, so the branches are host-side and
+  // always taken there.
   const unsigned char *p = base + pred_off;
-  std::memcpy(out_ct, p, want);
-  std::memcpy(out_dt, p + stride, want);
-  std::memcpy(out_r, p + 2 * stride, want);
-  std::memcpy(out_p, p + 3 * stride, want);
+  if (out_ct != nullptr) std::memcpy(out_ct, p, want);
+  if (out_dt != nullptr) std::memcpy(out_dt, p + stride, want);
+  if (out_r != nullptr) std::memcpy(out_r, p + 2 * stride, want);
+  if (out_p != nullptr) std::memcpy(out_p, p + 3 * stride, want);
   if (out_rmse != nullptr) std::memcpy(out_rmse, p + 4 * stride, want);
   if (out_maxe != nullptr) std::memcpy(out_maxe, p + 5 * stride, want);
   if (out_mae != nullptr) std::memcpy(out_mae, p + 6 * stride, want);
@@ -1435,7 +1448,6 @@ bool NeuroPressGpuInferBatchDeviceStats(
   if (!s.ok) return false;
 
   cudaStream_t st = static_cast<cudaStream_t>(stream);
-  const size_t out_bytes = sizeof(float) * static_cast<size_t>(num_candidates);
   const size_t act_bytes = sizeof(int) * static_cast<size_t>(num_candidates);
 
   // Everything below is enqueued on the SAME stream the statistics were
@@ -1556,41 +1568,6 @@ bool NeuroPressGpuInferBatchDeviceStats(
   return ok;
 }
 
-/**
- * Persistent scratch for the all-outputs path, mirroring InferScratch. Held
- * per thread and grown rather than reallocated, so a repeated caller does no
- * allocation in the steady state.
- */
-struct FullScratch {
-  float *d_raw = nullptr;
-  float *d_out[8] = {nullptr};
-  int cap = 0;
-};
-
-FullScratch &Full() {
-  static thread_local FullScratch s;
-  return s;
-}
-
-bool EnsureFullCapacity(FullScratch &s, int n) {
-  if (n <= s.cap) return true;
-  cudaFree(s.d_raw);
-  for (int i = 0; i < 8; ++i) cudaFree(s.d_out[i]);
-  s.d_raw = nullptr;
-  for (int i = 0; i < 8; ++i) s.d_out[i] = nullptr;
-  s.cap = 0;
-
-  const size_t nn = static_cast<size_t>(n);
-  if (cudaMalloc(&s.d_raw, sizeof(float) * nn * kInputDim) != cudaSuccess) {
-    return false;
-  }
-  for (int i = 0; i < 8; ++i) {
-    if (cudaMalloc(&s.d_out[i], sizeof(float) * nn) != cudaSuccess) return false;
-  }
-  s.cap = n;
-  return true;
-}
-
 bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
                                  const float *raw_inputs, int num_candidates,
                                  float *out_comp_time_ms,
@@ -1600,19 +1577,25 @@ bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
                                  float *out_ssim) {
   if (!w || !raw_inputs || num_candidates <= 0) return false;
 
-  // Same discipline as the ranking path: the per-thread persistent stream and
-  // a scratch buffer that is grown, not reallocated. An earlier version of
-  // this function used nine cudaMalloc/cudaFree per call and a
-  // cudaDeviceSynchronize -- which stalls every other worker's kernels, not
-  // just this call's. That pattern was removed from the ranking path for
-  // exactly that reason (see NeuroPressGpuInferBatch) and must not come back
-  // in through a side entrance.
-  const size_t n = static_cast<size_t>(num_candidates);
-  const size_t out_bytes = sizeof(float) * n;
-  const size_t in_bytes = out_bytes * kInputDim;
+  // The SAME per-thread scratch the other two entry points use.
+  //
+  // This path used to own a second one (FullScratch): its own d_raw plus
+  // eight separate [cap] output arrays, i.e. a duplicate of what InferScratch
+  // already lays out -- d_raw is the identical [cap][8] input matrix, and
+  // d_ct/d_dt/d_r/d_p/d_rmse/d_maxe/d_mae/d_ssim are exactly these eight
+  // outputs, already contiguous inside one allocation. Two scratches meant
+  // two sets of device buffers per thread and two capacity-growth rules to
+  // keep in step, for one kernel that writes the same eight arrays.
+  //
+  // Sharing also collapses the readback: the eight D2H copies below became
+  // the single packed transfer FetchPredictionsSync already performs for the
+  // ranking path. These copies are latency-bound (~2.8 us apiece), so the
+  // count was the cost.
+  const size_t in_bytes = sizeof(float) * static_cast<size_t>(num_candidates) *
+                          kInputDim;
 
-  FullScratch &s = Full();
-  if (!EnsureFullCapacity(s, num_candidates)) return false;
+  InferScratch &s = Infer();
+  if (!s.ok || !EnsureInferCapacity(s, num_candidates)) return false;
   cudaStream_t st = static_cast<cudaStream_t>(ctp::DeviceStatsStream());
 
   bool ok = cudaMemcpyAsync(s.d_raw, raw_inputs, in_bytes,
@@ -1625,21 +1608,19 @@ bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
        device, so neither host thread blocks for it. */
     SgdWaitIfEverFired(st);
     InferKernelFull<<<num_candidates, kHiddenDim, 0, st>>>(
-        w, s.d_raw, s.d_out[0], s.d_out[1], s.d_out[2], s.d_out[3],
-        s.d_out[4], s.d_out[5], s.d_out[6], s.d_out[7], 100.0f);
+        w, s.d_raw, s.d_ct, s.d_dt, s.d_r, s.d_p, s.d_rmse, s.d_maxe,
+        s.d_mae, s.d_ssim, 100.0f);
     ok = cudaGetLastError() == cudaSuccess;
   }
-
-  float *host[8] = {out_comp_time_ms, out_decomp_time_ms, out_ratio,
-                    out_psnr_db,      out_rmse,           out_max_error,
-                    out_mae,          out_ssim};
-  for (int i = 0; ok && i < 8; ++i) {
-    if (host[i] == nullptr) continue;
-    ok = cudaMemcpyAsync(host[i], s.d_out[i], out_bytes,
-                         cudaMemcpyDeviceToHost, st) == cudaSuccess;
+  if (ok) {
+    // out_order null keeps this a predictions-only fetch; the quality
+    // pointers being non-null extend it to all eight. Any of them may be
+    // null, which is this entry point's documented contract.
+    ok = FetchPredictionsSync(s, num_candidates, st, out_comp_time_ms,
+                              out_decomp_time_ms, out_ratio, out_psnr_db,
+                              /*out_order=*/nullptr, /*out_scores=*/nullptr,
+                              out_rmse, out_max_error, out_mae, out_ssim);
   }
-  // One wait on OUR stream, not the device.
-  if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
   return ok;
 }
 
@@ -1694,10 +1675,9 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
 // ============================================================================
 __device__ __forceinline__ void ForwardOneLayer(
     const float *__restrict__ w_layer, const float *__restrict__ b_layer,
-    const float *in, int fan_in, int t, float &z_out, float &h_out) {
+    const float *in, int fan_in, int t, float &h_out) {
   float sum = b_layer[t];
   for (int i = 0; i < fan_in; ++i) sum += w_layer[t * fan_in + i] * in[i];
-  z_out = sum;
   h_out = fmaxf(0.0f, sum);
 }
 
@@ -1736,28 +1716,24 @@ __device__ __forceinline__ void SgdForwardAndErrors(
     }
     __syncthreads();
 
-    float z, h;
+    float h;
     ForwardOneLayer(&w->params[kOffW1], &w->params[kOffB1], w->act_x[si],
-                    kInputDim, t, z, h);
-    w->act_z1[si][t] = z;
+                    kInputDim, t, h);
     w->act_h1[si][t] = h;
     __syncthreads();
 
     ForwardOneLayer(&w->params[kOffW2], &w->params[kOffB2], w->act_h1[si],
-                    kHiddenDim, t, z, h);
-    w->act_z2[si][t] = z;
+                    kHiddenDim, t, h);
     w->act_h2[si][t] = h;
     __syncthreads();
 
     ForwardOneLayer(&w->params[kOffW3], &w->params[kOffB3], w->act_h2[si],
-                    kHiddenDim, t, z, h);
-    w->act_z3[si][t] = z;
+                    kHiddenDim, t, h);
     w->act_h3[si][t] = h;
     __syncthreads();
 
     ForwardOneLayer(&w->params[kOffW4], &w->params[kOffB4], w->act_h3[si],
-                    kHiddenDim, t, z, h);
-    w->act_z4[si][t] = z;
+                    kHiddenDim, t, h);
     w->act_h4[si][t] = h;
     __syncthreads();
 
@@ -1857,37 +1833,53 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
   for (int i = t; i < kParamCount; i += kHiddenDim) w->combined[i] = 0.0f;
   __syncthreads();
 
+  // ---- Step 1, once per sample: L4 backward delta for ALL outputs,
+  // normalized to unit vectors.
+  //
+  // This was computed INSIDE the target_out loop below, which rebuilt it
+  // kOutputDim times over from inputs the loop never writes: d5_clamped and
+  // act_h4 are fixed by SgdForwardAndErrors, and params is not updated until
+  // the trust-region step after the loop closes. Each rebuild ran kOutputDim
+  // block-wide reductions, so seven eighths of 64 reductions per sample were
+  // recomputing a value already in memory.
+  //
+  // Same arithmetic, same operand order, same reduction tree -- only the
+  // number of times it is evaluated changes, and dz4_all now carries a slot
+  // per sample so the target_out loop reads what this pass wrote.
+  for (int si = 0; si < num_samples; ++si) {
+    for (int o = 0; o < kOutputDim; ++o) {
+      float es = w->d5_clamped[si][o];
+      float dh4_t = w->params[kOffW5 + o * kHiddenDim + t] * es;
+      float v = (w->act_h4[si][t] > 0.0f) ? dh4_t : 0.0f;
+      w->dz4_all[si][o][t] = v;
+    }
+    __syncthreads();
+    for (int o = 0; o < kOutputDim; ++o) {
+      float local = w->dz4_all[si][o][t] * w->dz4_all[si][o][t];
+      s_reduce[t] = local;
+      __syncthreads();
+      for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
+        if (t < s) s_reduce[t] += s_reduce[t + s];
+        __syncthreads();
+      }
+      float norm = sqrtf(s_reduce[0]) + 1e-6f;
+      w->dz4_all[si][o][t] /= norm;
+      __syncthreads();
+    }
+  }
+
   for (int target_out = 0; target_out < kOutputDim; ++target_out) {
     for (int i = t; i < kParamCount; i += kHiddenDim) w->out_grad[i] = 0.0f;
     __syncthreads();
 
     for (int si = 0; si < num_samples; ++si) {
-      // Step 1: L4 backward delta for ALL outputs, normalized to unit vectors.
-      for (int o = 0; o < kOutputDim; ++o) {
-        float es = w->d5_clamped[si][o];
-        float dh4_t = w->params[kOffW5 + o * kHiddenDim + t] * es;
-        float v = (w->act_z4[si][t] > 0.0f) ? dh4_t : 0.0f;
-        w->dz4_all[o][t] = v;
-      }
-      __syncthreads();
-      for (int o = 0; o < kOutputDim; ++o) {
-        float local = w->dz4_all[o][t] * w->dz4_all[o][t];
-        s_reduce[t] = local;
-        __syncthreads();
-        for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
-          if (t < s) s_reduce[t] += s_reduce[t + s];
-          __syncthreads();
-        }
-        float norm = sqrtf(s_reduce[0]) + 1e-6f;
-        w->dz4_all[o][t] /= norm;
-        __syncthreads();
-      }
-
       // Step 2: PCGrad projection for target_out against every other output.
-      float my_dz4 = w->dz4_all[target_out][t];
+      // Step 1 (the normalized L4 deltas) was hoisted above the target_out
+      // loop -- it does not depend on target_out.
+      float my_dz4 = w->dz4_all[si][target_out][t];
       for (int j = 0; j < kOutputDim; ++j) {
         if (j == target_out) continue;
-        float local_dot = my_dz4 * w->dz4_all[j][t];
+        float local_dot = my_dz4 * w->dz4_all[si][j][t];
         s_reduce[t] = local_dot;
         __syncthreads();
         for (int s = kHiddenDim / 2; s > 0; s >>= 1) {
@@ -1895,7 +1887,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
           __syncthreads();
         }
         float cos_ij = s_reduce[0];
-        if (cos_ij < kPcgradCosThresh) my_dz4 -= cos_ij * w->dz4_all[j][t];
+        if (cos_ij < kPcgradCosThresh) my_dz4 -= cos_ij * w->dz4_all[si][j][t];
         __syncthreads();
       }
       float err_mag = fabsf(w->d5_clamped[si][target_out]);
@@ -1920,7 +1912,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
       float dh3_t = 0.0f;
       for (int j = 0; j < kHiddenDim; ++j)
         dh3_t += w->params[kOffW4 + j * kHiddenDim + t] * s_dz4[j];
-      float dz3 = (w->act_z3[si][t] > 0.0f) ? dh3_t : 0.0f;
+      float dz3 = (w->act_h3[si][t] > 0.0f) ? dh3_t : 0.0f;
 
       // Step 5/5b: L3 gradient, backward L3->L2.
       for (int i = 0; i < kHiddenDim; ++i)
@@ -1932,7 +1924,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
       float dh2_t = 0.0f;
       for (int j = 0; j < kHiddenDim; ++j)
         dh2_t += w->params[kOffW3 + j * kHiddenDim + t] * s_dz3[j];
-      float dz2 = (w->act_z2[si][t] > 0.0f) ? dh2_t : 0.0f;
+      float dz2 = (w->act_h2[si][t] > 0.0f) ? dh2_t : 0.0f;
 
       // Step 6/6b: L2 gradient, backward L2->L1, then L1 gradient.
       for (int i = 0; i < kHiddenDim; ++i)
@@ -1944,7 +1936,7 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
       float dh1_t = 0.0f;
       for (int j = 0; j < kHiddenDim; ++j)
         dh1_t += w->params[kOffW2 + j * kHiddenDim + t] * s_dz2[j];
-      float dz1 = (w->act_z1[si][t] > 0.0f) ? dh1_t : 0.0f;
+      float dz1 = (w->act_h1[si][t] > 0.0f) ? dh1_t : 0.0f;
 
       for (int i = 0; i < kInputDim; ++i)
         w->out_grad[kOffW1 + t * kInputDim + i] += dz1 * w->act_x[si][i];
@@ -2130,26 +2122,26 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
       float dz = ema[kOffB1 + t];
       for (int i = 0; i < kInputDim; ++i)
         dz += ema[kOffW1 + t * kInputDim + i] * w->act_x[si][i];
-      s_tan_a[t] = (w->act_z1[si][t] > 0.0f) ? dz : 0.0f;
+      s_tan_a[t] = (w->act_h1[si][t] > 0.0f) ? dz : 0.0f;
       __syncthreads();
       // L2: dz2 = dW2 h1 + W2 dh1 + db2, and likewise below.
       dz = ema[kOffB2 + t];
       for (int i = 0; i < kHiddenDim; ++i)
         dz += ema[kOffW2 + t * kHiddenDim + i] * w->act_h1[si][i] +
               w->params[kOffW2 + t * kHiddenDim + i] * s_tan_a[i];
-      s_tan_b[t] = (w->act_z2[si][t] > 0.0f) ? dz : 0.0f;
+      s_tan_b[t] = (w->act_h2[si][t] > 0.0f) ? dz : 0.0f;
       __syncthreads();
       dz = ema[kOffB3 + t];
       for (int i = 0; i < kHiddenDim; ++i)
         dz += ema[kOffW3 + t * kHiddenDim + i] * w->act_h2[si][i] +
               w->params[kOffW3 + t * kHiddenDim + i] * s_tan_b[i];
-      s_tan_a[t] = (w->act_z3[si][t] > 0.0f) ? dz : 0.0f;
+      s_tan_a[t] = (w->act_h3[si][t] > 0.0f) ? dz : 0.0f;
       __syncthreads();
       dz = ema[kOffB4 + t];
       for (int i = 0; i < kHiddenDim; ++i)
         dz += ema[kOffW4 + t * kHiddenDim + i] * w->act_h3[si][i] +
               w->params[kOffW4 + t * kHiddenDim + i] * s_tan_a[i];
-      s_tan_b[t] = (w->act_z4[si][t] > 0.0f) ? dz : 0.0f;
+      s_tan_b[t] = (w->act_h4[si][t] > 0.0f) ? dz : 0.0f;
       __syncthreads();
       // Heads 0..3, only where this sample carried an error for that head.
       if (t < 4 && w->d5_raw[si][t] != 0.0f) {
@@ -2240,7 +2232,7 @@ __global__ void AdaptiveSGDKernel(
       dh4 += w->params[kOffW5 + oi * kHiddenDim + t] * e;
     }
     if (t < kOutputDim) w->combined[kOffB5 + t] += w->d5_clamped[si][t];
-    const float dz4 = (w->act_z4[si][t] > 0.0f) ? dh4 : 0.0f;
+    const float dz4 = (w->act_h4[si][t] > 0.0f) ? dh4 : 0.0f;
 
     for (int i = 0; i < kHiddenDim; ++i)
       w->combined[kOffW4 + t * kHiddenDim + i] += dz4 * w->act_h3[si][i];
@@ -2251,7 +2243,7 @@ __global__ void AdaptiveSGDKernel(
     float dh3 = 0.0f;
     for (int j = 0; j < kHiddenDim; ++j)
       dh3 += w->params[kOffW4 + j * kHiddenDim + t] * s_dz4[j];
-    const float dz3 = (w->act_z3[si][t] > 0.0f) ? dh3 : 0.0f;
+    const float dz3 = (w->act_h3[si][t] > 0.0f) ? dh3 : 0.0f;
     for (int i = 0; i < kHiddenDim; ++i)
       w->combined[kOffW3 + t * kHiddenDim + i] += dz3 * w->act_h2[si][i];
     w->combined[kOffB3 + t] += dz3;
@@ -2261,7 +2253,7 @@ __global__ void AdaptiveSGDKernel(
     float dh2 = 0.0f;
     for (int j = 0; j < kHiddenDim; ++j)
       dh2 += w->params[kOffW3 + j * kHiddenDim + t] * s_dz3[j];
-    const float dz2 = (w->act_z2[si][t] > 0.0f) ? dh2 : 0.0f;
+    const float dz2 = (w->act_h2[si][t] > 0.0f) ? dh2 : 0.0f;
     for (int i = 0; i < kHiddenDim; ++i)
       w->combined[kOffW2 + t * kHiddenDim + i] += dz2 * w->act_h1[si][i];
     w->combined[kOffB2 + t] += dz2;
@@ -2271,7 +2263,7 @@ __global__ void AdaptiveSGDKernel(
     float dh1 = 0.0f;
     for (int j = 0; j < kHiddenDim; ++j)
       dh1 += w->params[kOffW2 + j * kHiddenDim + t] * s_dz2[j];
-    const float dz1 = (w->act_z1[si][t] > 0.0f) ? dh1 : 0.0f;
+    const float dz1 = (w->act_h1[si][t] > 0.0f) ? dh1 : 0.0f;
     for (int i = 0; i < kInputDim; ++i)
       w->combined[kOffW1 + t * kInputDim + i] += dz1 * w->act_x[si][i];
     w->combined[kOffB1 + t] += dz1;

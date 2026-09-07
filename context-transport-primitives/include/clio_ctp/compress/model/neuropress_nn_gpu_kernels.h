@@ -140,8 +140,9 @@ void NeuroPressGpuUploadWeights(NeuroPressGpuWeights *w, const float *weights,
  * -log(1-ssim) and inverts with `1 - exp(-max(0,x))`, NOT with expm1f like
  * the other three.
  *
- * Not on the ranking path: allocates per call. For reporting and for the
- * differential test against upstream.
+ * Not on the ranking path -- for reporting and for the differential test
+ * against upstream -- but it shares the ranking path's per-thread scratch and
+ * its single packed readback, so it allocates nothing in the steady state.
  */
 bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
                                  const float *raw_inputs, int num_candidates,

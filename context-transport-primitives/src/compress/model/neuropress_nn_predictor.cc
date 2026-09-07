@@ -468,24 +468,21 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
-  // Only the four genuinely host-side inputs are assembled here. Inputs 5-7
-  // (entropy, MAD, second derivative) are deliberately NOT read off `batch`
-  // -- they live on the device and the kernel reads them there. Input 4 is
-  // the chunk size, identical for every candidate, so it rides as a scalar.
-  std::vector<float> desc(batch.size() * 4);
-  for (size_t i = 0; i < batch.size(); ++i) {
-    // RAW error bound, sentinel NOT applied. Upstream substitutes the 1e-7
-    // lossless sentinel inside its inference kernel
-    // (`input_raw[3] = (quant == 0) ? 1e-7f : eb_enc`, nn_gpu.cu) rather
-    // than in whatever assembled the inputs, so InferKernelDeviceStats does
-    // it there too -- the descriptor now carries what the caller actually
-    // configured and the substitution is the model's own, as it is upstream.
-    const auto x = FeaturesTo8Input(batch[i], /*apply_lossless_sentinel=*/false);
-    desc[i * 4 + 0] = x[0];  // algo_id
-    desc[i * 4 + 1] = x[1];  // quantize
-    desc[i * 4 + 2] = x[2];  // byte_shuffle
-    desc[i * 4 + 3] = x[3];  // error bound, raw
-  }
+  // NOTHING about a candidate's input vector is assembled here.
+  //
+  // Inputs 0-2 are decoded in-kernel from the action index below; input 3
+  // (the raw bound, with the 1e-7 lossless sentinel applied by the model, as
+  // upstream applies it) and input 4 (the chunk size) ride in as scalars; and
+  // inputs 5-7 -- entropy, MAD, second derivative -- are deliberately NOT
+  // read off `batch` at all, because they live on the device and the kernel
+  // reads them there.
+  //
+  // A four-wide per-candidate descriptor used to be built here and handed to
+  // the kernel. The kernel stopped taking it when it began decoding the
+  // action index itself, but the loop that filled it stayed -- calling
+  // FeaturesTo8Input, which returns by value, once per candidate. That was a
+  // vector allocation per candidate plus one for the descriptor, per chunk,
+  // on the selection path, for a buffer nothing read.
 
   std::vector<float> comp_time(batch.size()), decomp_time(batch.size()),
       ratio(batch.size()), psnr(batch.size());
