@@ -949,10 +949,24 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
       reuse_slot != ctp::compress::preprocess::kNoLineageSlot) {
     const ctp::compress::preprocess::DevicePredictionReuseState &ts =
         reuse_states[reuse_slot];
+    // The replay condition must be UNIFORM across the block, so `tid < n`
+    // guards the write and not the return. With it in the return condition,
+    // a replay of fewer than kMaxCandidates candidates retired lanes
+    // [0, n) and left lanes [n, 32) to fall through into the bitonic network
+    // below -- which calls __shfl_xor_sync with a full 0xFFFFFFFF mask,
+    // naming the lanes that just exited. That is undefined behaviour.
+    //
+    // It never produced a wrong answer, because the surviving lanes write
+    // only under `tid < n` and so discard whatever the shuffles returned, and
+    // it is unreachable whenever the caller passes all 32 candidates -- which
+    // the production bridge does. A caller ranking a subset AND hitting a
+    // reuse replay is what reaches it.
     if (!ctp::compress::preprocess::MustRunModel(ts.decision_flags) &&
-        ts.has_prediction != 0 && ts.cached_count >= n && tid < n) {
-      out_order[tid] = ts.order[tid];
-      out_scores[tid] = ts.score[tid];
+        ts.has_prediction != 0 && ts.cached_count >= n) {
+      if (tid < n) {
+        out_order[tid] = ts.order[tid];
+        out_scores[tid] = ts.score[tid];
+      }
       return;
     }
   }
