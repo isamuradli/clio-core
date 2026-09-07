@@ -1293,6 +1293,21 @@ bool EnsureInferCapacity(InferScratch &s, int n) {
   s.d_maxe = s.d_pred + 5 * n;
   s.d_mae = s.d_pred + 6 * n;
   s.d_ssim = s.d_pred + 7 * n;
+  // Zero ONCE, here, not per call.
+  //
+  // The readback below is cap-strided, so when a call ranks fewer candidates
+  // than the capacity the transfer's tail covers slots no kernel has written.
+  // Those bytes are never scattered to the caller -- the host scatter stops
+  // at `n` for every region -- so nothing was ever computed from them, but the
+  // copy was still sourcing uninitialised device memory, which
+  // `compute-sanitizer --tool initcheck` reports (9 findings, all this one
+  // site) and which leaves the untouched tail holding whatever the allocator
+  // handed back.
+  //
+  // Zeroing at allocation time costs nothing on the per-chunk path: capacity
+  // only grows, so in the steady state this runs once per thread. It changes
+  // no value any caller reads.
+  if (cudaMemset(s.d_out, 0, PackedOutBytes(nn)) != cudaSuccess) return false;
   s.host_out.resize(PackedOutBytes(nn));
   s.cap = n;
   return true;
