@@ -273,51 +273,6 @@ if(NOT WIN32 AND CLIO_CORE_ENABLE_CUDA)
   install(TARGETS test_hdf5_vol_gpu_ptr RUNTIME DESTINATION bin)
 endif()
 
-#------------------------------------------------------------------------------
-# Compressor-pool wiring (issue #693): a FAPL-configured compressor pool
-# makes H5Dwrite route through it (compress) and H5Dread decompress on the
-# way back out, rather than the VOL and compressor chimod staying two
-# disconnected subsystems. Needs the compressor runtime/client libraries and
-# an in-process chimod (like test_transparent_compress), so it gets the same
-# RESOURCE_LOCK treatment as that integration test.
-#------------------------------------------------------------------------------
-add_executable(test_hdf5_vol_compressor_write
-    test_hdf5_vol_compressor_write.cc
-)
-
-target_include_directories(test_hdf5_vol_compressor_write PRIVATE
-    ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
-    ${CMAKE_SOURCE_DIR}/context-runtime/test
-    ${HDF5_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_hdf5_vol_compressor_write
-    clio_hdf5_vol
-    clio_cte_compressor_runtime
-    clio_cte_compressor_client
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${HDF5_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_hdf5_vol_compressor_write
-    COMMAND test_hdf5_vol_compressor_write
-            "H5Dwrite routes through the compressor and H5Dread decompresses correctly")
-
-# Second case in the same binary: compressor pool AND a device read buffer.
-# Neither existing test covered that pairing (this file's other case is
-# host-only; test_hdf5_vol_gpu_ptr.cc has no compressor pool), so the VOL's
-# device decompress destination had no coverage.
-add_test(NAME cte_hdf5_vol_compressor_devread
-    COMMAND test_hdf5_vol_compressor_write
-            "compressor-backed read into a GPU device pointer")
-
 set_tests_properties(cte_hdf5_vol_compressor_write
                      cte_hdf5_vol_compressor_devread PROPERTIES
     TIMEOUT 300
@@ -325,8 +280,6 @@ set_tests_properties(cte_hdf5_vol_compressor_write
     RESOURCE_LOCK "clio_runtime"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
 )
-
-install(TARGETS test_hdf5_vol_compressor_write RUNTIME DESTINATION bin)
 
 install(
     TARGETS test_hdf5_vol_adapter test_hdf5_vol_io

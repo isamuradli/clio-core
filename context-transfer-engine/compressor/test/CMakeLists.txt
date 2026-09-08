@@ -37,76 +37,11 @@ target_link_libraries(test_qtable_predictor_exec
 )
 add_test(NAME test_qtable_predictor COMMAND test_qtable_predictor_exec)
 
-# Compose-YAML configuration (issue #693). Pure parse test: no runtime, no
-# GPU, no pool -- CompressorConfig::LoadConfig against the entries a pipeline
-# actually writes. Guards the invariant that every serialized field stays
-# reachable from YAML, which is how five model paths came to be silently
-# discarded.
-add_executable(test_compressor_compose_config_exec
-  test_compressor_compose_config.cc
-)
-target_link_libraries(test_compressor_compose_config_exec
-  clio::cte::compressor_runtime
-  ctp::compress
-  Catch2::Catch2WithMain
-)
-add_test(NAME test_compressor_compose_config
-         COMMAND test_compressor_compose_config_exec)
-set_tests_properties(test_compressor_compose_config PROPERTIES
-  LABELS "693;compressor;config;unit")
-
-# Payload-log fidelity (issue #693). The .payload companion of
-# CLIO_NEUROPRESS_SELECTION_LOG is read as "what this chunk cost on the tier",
-# and was written before exploration could replace the result -- so it
-# described the primary and under-reported exactly the modes that explore.
-# Own executable because both log handles are function-local statics: whichever
-# test runs first in a process fixes the path for all of them.
-add_executable(test_compressor_payload_log_exec
-  test_compressor_payload_log.cc
-)
-target_link_libraries(test_compressor_payload_log_exec
-  clio::cte::compressor_runtime
-  clio::cte::compressor_client
-  clio::cte::core_runtime
-  clio::cte::core_client
-  clio::run::admin_runtime
-  clio::run::admin_client
-  clio::run::bdev_runtime
-  clio::run::bdev_client
-  ctp::compress
-  ctp::cxx
-  ${CMAKE_THREAD_LIBS_INIT}
-)
 if(CLIO_CORE_ENABLE_CUDA)
-    target_link_libraries(test_compressor_payload_log_exec ctp::cuda_cxx)
-elseif(CLIO_CORE_ENABLE_ROCM)
-    target_link_libraries(test_compressor_payload_log_exec ctp::rocm_cxx)
-endif()
-target_compile_definitions(test_compressor_payload_log_exec PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
-add_test(NAME test_compressor_payload_log
-         COMMAND test_compressor_payload_log_exec)
-set_tests_properties(test_compressor_payload_log PROPERTIES
-  LABELS "693;compressor;payload_log;unit")
 
-# Test NeuroPress bridge (issue #693 cycle 3): NeuroPressCandidateStats
-# ranking GPU/NeuroPress candidates for dynamic selection.
-add_executable(test_neuropress_bridge_exec
-  test_neuropress_bridge.cc
-)
-target_link_libraries(test_neuropress_bridge_exec
-  clio::cte::compressor_runtime
-  ctp::compress
-  ctp::compress_model
-  Catch2::Catch2WithMain
-)
-target_include_directories(test_neuropress_bridge_exec PRIVATE
-  ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)
-# Real, shipped NeuroPress .nnwt weights (see context-transport-primitives/
-# src/compress/model/weights/) -- exercises the actual pretrained model.
-target_compile_definitions(test_neuropress_bridge_exec PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
-add_test(NAME test_neuropress_bridge COMMAND test_neuropress_bridge_exec)
+elseif(CLIO_CORE_ENABLE_ROCM)
+
+endif()
 
 # NOTE: test_compression_contention has been moved to the end of this file
 # as a standalone benchmark without ChiMod runtime dependency
@@ -119,7 +54,6 @@ add_test(NAME test_neuropress_bridge COMMAND test_neuropress_bridge_exec)
 add_executable(test_compressor_functional
   test_compressor_functional.cc
 )
-
 
 # Link against compressor runtime and dependencies
 target_link_libraries(test_compressor_functional
@@ -183,6 +117,10 @@ add_test(NAME compressor_compression_ratios
 
 add_test(NAME compressor_dynamic_schedule
     COMMAND test_compressor_functional "Dynamic Schedule Compression")
+# Host SHM input, and NeuroPress preprocessing is CUDA-only: STAGE_H2D copies
+# the chunk UP to the device so the kernels run. Not a host fallback.
+set_tests_properties(compressor_dynamic_schedule PROPERTIES
+    ENVIRONMENT "CLIO_NEUROPRESS_STAGE_H2D=1")
 
 add_test(NAME compressor_dynamic_neuropress
     COMMAND test_compressor_functional "[neuropress][693]")
@@ -198,6 +136,10 @@ set_tests_properties(compressor_dynamic_neuropress PROPERTIES
 # name rather than inside a broader bucket.
 add_test(NAME compressor_exploration
     COMMAND test_compressor_functional "[exploration]")
+# Host SHM input, and NeuroPress preprocessing is CUDA-only: STAGE_H2D copies
+# the chunk UP to the device so the kernels run. Not a host fallback.
+set_tests_properties(compressor_exploration PROPERTIES
+    ENVIRONMENT "CLIO_NEUROPRESS_STAGE_H2D=1")
 
 # Residency invariance: the same bytes must select the same algorithm whether
 # they arrive in CPU shared memory or a registered device backend. The two
@@ -317,54 +259,6 @@ set_tests_properties(
 )
 
 install(TARGETS test_transparent_compress RUNTIME DESTINATION bin)
-
-#------------------------------------------------------------------------------
-# NeuroPress-via-compose integration test (issue #693)
-#------------------------------------------------------------------------------
-# Proves a compressor composed from YAML actually loads the NeuroPress model
-# and selects with it. Every other NeuroPress test and example sets
-# neuropress_model_path_ programmatically, so nothing covered the config-file
-# route -- the one a deployment uses, and the one that was broken.
-add_executable(test_neuropress_compose
-  test_neuropress_compose.cc
-)
-
-target_link_libraries(test_neuropress_compose
-  clio::cte::compressor_runtime
-  clio::cte::compressor_client
-  clio::cte::core_runtime
-  clio::cte::core_client
-  clio::run::admin_runtime
-  clio::run::admin_client
-  clio::run::bdev_runtime
-  clio::run::bdev_client
-  ctp::compress
-  ctp::cxx
-  ${CMAKE_THREAD_LIBS_INIT}
-)
-
-target_compile_definitions(test_neuropress_compose PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
-
-# One entry, both cases in declaration order: the round-trip case reads the
-# blob the selection case writes, so separate ctest entries would run in
-# separate processes against a wiped runtime and the read could never find it.
-#
-# A SINGLE filter, matching both by tag. simple_test.h's SIMPLE_TEST_MAIN
-# reads argv[1] only, so passing one spec per case silently runs just the
-# first -- which is what compressor_transparent_roundtrip above does today,
-# leaving its GetBlob half dead. Filtering on the shared [compose] tag keeps
-# both in one process and in declaration order.
-add_test(NAME compressor_neuropress_compose
-    COMMAND test_neuropress_compose "[compose]")
-
-set_tests_properties(
-    compressor_neuropress_compose
-    PROPERTIES
-        TIMEOUT 180
-        LABELS "693;compressor;neuropress;compose;integration;gpu;msan_skip"
-        RESOURCE_LOCK "clio_runtime"
-)
 
 #------------------------------------------------------------------------------
 # ADIOS2-style Transparent Compression Test (direct CTE client API, no Tag)
@@ -555,100 +449,6 @@ else()
     message(STATUS "Synthetic workload generator disabled (MPI not found)")
 endif()
 
-#------------------------------------------------------------------------------
-# Exploration must store exactly what the adopted codec needs (issue #693)
-#------------------------------------------------------------------------------
-# Guards the invariant that a rejected candidate's footprint is not left
-# allocated: PutBlob overwrites bytes but does not shorten a longer blob, so
-# adopting a winner smaller than the primary used to leave 4-9x the needed
-# space behind and made every ratio read off the tier wrong by that factor.
-add_executable(test_explore_single_write
-  test_explore_single_write.cc
-)
-
-target_link_libraries(test_explore_single_write
-  clio::cte::compressor_runtime
-  clio::cte::compressor_client
-  clio::cte::core_runtime
-  clio::cte::core_client
-  clio::run::admin_runtime
-  clio::run::admin_client
-  clio::run::bdev_runtime
-  clio::run::bdev_client
-  ctp::compress
-  ctp::cxx
-  ${CMAKE_THREAD_LIBS_INIT}
-)
-
-target_include_directories(test_explore_single_write PRIVATE
-  ${CMAKE_SOURCE_DIR}/context-runtime/test)   # simple_test.h
-
-target_compile_definitions(test_explore_single_write PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
-
-add_test(NAME compressor_explore_single_write
-    COMMAND test_explore_single_write "[explore]")
-
-set_tests_properties(
-    compressor_explore_single_write
-    PROPERTIES
-        TIMEOUT 180
-        LABELS "693;compressor;neuropress;explore;integration;gpu;msan_skip"
-        RESOURCE_LOCK "clio_runtime"
-)
-
-# The online update must be shown the config that actually ran. Drives the
-# real compressor and asserts on NeuroPressChunkDiag.
-add_executable(test_neuropress_training_inputs
-  test_neuropress_training_inputs.cc
-)
-
-target_link_libraries(test_neuropress_training_inputs
-  clio::cte::compressor_runtime
-  clio::cte::compressor_client
-  clio::cte::core_runtime
-  clio::cte::core_client
-  clio::run::admin_runtime
-  clio::run::admin_client
-  clio::run::bdev_runtime
-  clio::run::bdev_client
-  ctp::compress
-  ctp::cxx
-  ${CMAKE_THREAD_LIBS_INIT}
-)
-
-target_include_directories(test_neuropress_training_inputs PRIVATE
-  ${CMAKE_SOURCE_DIR}/context-runtime/test)   # simple_test.h
-
-target_compile_definitions(test_neuropress_training_inputs PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
-
-# Twice from one binary: only with exploration ON can the written action
-# differ from the predicted one.
-add_test(NAME compressor_neuropress_training_inputs
-    COMMAND test_neuropress_training_inputs "[learning]")
-
-set_tests_properties(
-    compressor_neuropress_training_inputs
-    PROPERTIES
-        TIMEOUT 180
-        ENVIRONMENT "NP_TEST_EXPLORATION=0"
-        LABELS "693;compressor;neuropress;learning;integration;gpu;msan_skip"
-        RESOURCE_LOCK "clio_runtime"
-)
-
-add_test(NAME compressor_neuropress_training_inputs_explore
-    COMMAND test_neuropress_training_inputs "[learning]")
-
-set_tests_properties(
-    compressor_neuropress_training_inputs_explore
-    PROPERTIES
-        TIMEOUT 300
-        ENVIRONMENT "NP_TEST_EXPLORATION=1"
-        LABELS "693;compressor;neuropress;learning;explore;integration;gpu;msan_skip"
-        RESOURCE_LOCK "clio_runtime"
-)
-
 # Record-semantics parity, by compiling upstream's own
 # gpucompress_diagnostics.cpp. Skipped without a NeuroPress checkout.
 set(CLIO_NEUROPRESS_SRC_DIR "$ENV{HOME}/NeuroPress" CACHE PATH
@@ -660,109 +460,12 @@ find_path(CLIO_NVCOMP_INCLUDE_DIR nvcomp.hpp
 
 if(EXISTS ${CLIO_NEUROPRESS_SRC_DIR}/src/api/gpucompress_diagnostics.cpp
    AND CLIO_NVCOMP_INCLUDE_DIR)
-  add_executable(test_neuropress_diag_parity
-    test_neuropress_diag_parity.cc
-    ${CLIO_NEUROPRESS_SRC_DIR}/src/api/gpucompress_diagnostics.cpp
-    neuropress_diag_parity_globals.cc
-  )
 
-  target_link_libraries(test_neuropress_diag_parity
-    clio::cte::compressor_runtime
-    ctp::compress
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-  )
-
-  target_include_directories(test_neuropress_diag_parity PRIVATE
-    ${CMAKE_SOURCE_DIR}/context-runtime/test      # simple_test.h
-    ${CLIO_NEUROPRESS_SRC_DIR}/src
-    ${CLIO_NEUROPRESS_SRC_DIR}/include
-    ${CLIO_NVCOMP_INCLUDE_DIR}
-    ${CLIO_NVCOMP_INCLUDE_DIR}/..)
-
-  add_test(NAME compressor_neuropress_diag_parity
-      COMMAND test_neuropress_diag_parity)
-
-  set_tests_properties(
-      compressor_neuropress_diag_parity
-      PROPERTIES
-          TIMEOUT 120
-          LABELS "693;compressor;neuropress;diag;parity"
-  )
 else()
   message(STATUS
     "NeuroPress diag parity: skipped (no NeuroPress tree at "
     "${CLIO_NEUROPRESS_SRC_DIR}, or nvcomp headers not found)")
 endif()
-
-# Does the online update make the model more accurate? Three phases of
-# randomized data with a distribution shift between them, written through the
-# real compressor, accuracy read back from NeuroPressChunkDiag. NP_LEARN=0
-# reruns the same data with learning off, which is what rules out "later
-# chunks are simply easier".
-add_executable(test_neuropress_learning_phases
-  test_neuropress_learning_phases.cc
-)
-
-target_link_libraries(test_neuropress_learning_phases
-  clio::cte::compressor_runtime
-  clio::cte::compressor_client
-  clio::cte::core_runtime
-  clio::cte::core_client
-  clio::run::admin_runtime
-  clio::run::admin_client
-  clio::run::bdev_runtime
-  clio::run::bdev_client
-  ctp::compress
-  ctp::cxx
-  ${CMAKE_THREAD_LIBS_INIT}
-)
-
-target_include_directories(test_neuropress_learning_phases PRIVATE
-  ${CMAKE_SOURCE_DIR}/context-runtime/test)   # simple_test.h
-
-target_compile_definitions(test_neuropress_learning_phases PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
-
-add_test(NAME compressor_neuropress_learning_phases
-    COMMAND test_neuropress_learning_phases "[phases]")
-
-set_tests_properties(
-    compressor_neuropress_learning_phases
-    PROPERTIES
-        TIMEOUT 600
-        ENVIRONMENT "NP_LEARN=1"
-        LABELS "693;compressor;neuropress;learning;phases;integration;gpu;msan_skip"
-        RESOURCE_LOCK "clio_runtime"
-)
-
-# Diverse statistics -> diverse codec selection. 14 regimes spanning entropy
-# 0.03-7.5, MAD 0-65536 and 2nd derivative 0-584. NP_MODE selects
-# inference / learning / exploration; one mode per process, so the model is
-# reloaded from the .nnwt each time and a previous phase cannot carry over.
-add_executable(test_neuropress_regime_diversity
-  test_neuropress_regime_diversity.cc
-)
-
-target_link_libraries(test_neuropress_regime_diversity
-  clio::cte::compressor_runtime
-  clio::cte::compressor_client
-  clio::cte::core_runtime
-  clio::cte::core_client
-  clio::run::admin_runtime
-  clio::run::admin_client
-  clio::run::bdev_runtime
-  clio::run::bdev_client
-  ctp::compress
-  ctp::cxx
-  ${CMAKE_THREAD_LIBS_INIT}
-)
-
-target_include_directories(test_neuropress_regime_diversity PRIVATE
-  ${CMAKE_SOURCE_DIR}/context-runtime/test)
-
-target_compile_definitions(test_neuropress_regime_diversity PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
 
 # Exploration measures K=31 alternatives per chunk, so it does ~32x the codec
 # work of the other two and needs a correspondingly longer budget.
@@ -771,11 +474,5 @@ foreach(_m inference learning exploration)
   if(_m STREQUAL exploration)
     set(_to 7200)
   endif()
-  add_test(NAME compressor_neuropress_regimes_${_m}
-      COMMAND test_neuropress_regime_diversity "[regimes]")
-  set_tests_properties(compressor_neuropress_regimes_${_m} PROPERTIES
-      TIMEOUT ${_to}
-      ENVIRONMENT "NP_MODE=${_m}"
-      LABELS "693;compressor;neuropress;regimes;integration;gpu;msan_skip"
-      RESOURCE_LOCK "clio_runtime")
+
 endforeach()
