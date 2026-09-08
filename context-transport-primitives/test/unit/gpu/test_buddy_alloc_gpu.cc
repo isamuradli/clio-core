@@ -179,8 +179,8 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
    */
   SECTION("Alloc408ByteStructs1MBPerThread") {
     constexpr int    kNumThreads     = 32;
-    constexpr size_t kPerThreadBytes = 1u * 1024u * 1024u;   // 1 MB
-    constexpr size_t kBackendSize    = kNumThreads * kPerThreadBytes;  // 32 MB
+    constexpr size_t kPerThreadWant  = 1u * 1024u * 1024u;   // 1 MB requested
+    constexpr size_t kBackendSize    = kNumThreads * kPerThreadWant;  // 32 MB
 
     // ptxas -v shows this kernel compiles to 0 bytes stack frame (fully
     // register-allocated).  4 096 B matches the CLIO Runtime orchestrator setting
@@ -193,6 +193,17 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
     REQUIRE(backend.shm_init(backend_id, kBackendSize,
                              "/test_buddy_alloc_gpu", 0));
 
+    // Slice data_capacity_, NOT the requested size: GpuShmMmap puts data_ past
+    // its own header, so the usable region is smaller than what was asked for
+    // (33,488,896 of 33,554,432 here -- a 64 KiB header). Carving 32 x 1 MiB
+    // out of the requested size ran the LAST thread's slice off the end of the
+    // mapping, an 8-byte write ~38 KiB past it that compute-sanitizer catches
+    // and cudaDeviceSynchronize reports as error 700.
+    const size_t usable = static_cast<size_t>(backend.data_capacity_);
+    const size_t kPerThreadBytes =
+        (usable / kNumThreads) & ~static_cast<size_t>(4095);
+    REQUIRE(kPerThreadBytes >= 64u * 1024u);
+
     // Per-thread result array in pinned host memory (readable after sync).
     int *d_results = nullptr;
     cudaMallocHost(&d_results, kNumThreads * sizeof(int));
@@ -201,7 +212,7 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
 
     BuddyAllocKernel<<<1, kNumThreads>>>(
         backend.data_,
-        kBackendSize,
+        usable,
         kPerThreadBytes,
         backend_id,
         d_results);
