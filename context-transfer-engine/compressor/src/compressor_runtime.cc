@@ -1394,8 +1394,19 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         task->return_code_ = 1;
         CLIO_CO_RETURN;
       }
-      ctp::GpuApi::Memcpy(staged, static_cast<const char *>(chunk_data),
-                          chunk_size);
+      // DeviceAwareMemcpy, NOT GpuApi::Memcpy. Both block until the bytes are
+      // there, but GpuApi::Memcpy is a plain cudaMemcpy on the LEGACY DEFAULT
+      // STREAM, which implicitly synchronizes with every other blocking stream
+      // in the context -- so each worker's staging copy waited for, and was
+      // waited on by, every other worker's kernels. Measured on vpic/smoke at
+      // 2.46 GiB/s against 10.31 GiB/s achievable from ordinary pageable host
+      // memory at four threads on this machine: four times slower than the
+      // wire, and none of the gap was the copy.
+      //
+      // DeviceAwareMemcpy issues the same transfer on a thread-local
+      // cudaStreamNonBlocking stream and synchronizes only that one, so a
+      // worker orders against its own work and nobody else's.
+      ctp::DeviceAwareMemcpy(staged, chunk_data, chunk_size);
       chunk_data = staged;
       // Same convention Compress uses to hand a device-resident output back
       // (see where compressed_shm_ptr is built): a GPU backend minted by this
