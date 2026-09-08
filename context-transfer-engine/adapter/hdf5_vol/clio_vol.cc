@@ -2007,7 +2007,13 @@ static bool clio_stage_chunk(clio_dataset_t *dataset, size_t chunk_index,
             /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
             this_size, &device_ptr);
     if (!gpu_alloc_id.IsNull()) {
-      ctp::GpuApi::Memcpy(device_ptr, src, this_size);
+      // DEVICE-TO-DEVICE, so not GpuApi::Memcpy: cudaMemcpy does no host-side
+      // synchronization for D2D and would return with the copy in flight on
+      // the legacy default stream, while the pointer below is published to the
+      // compressor -- which runs its kernels on non-blocking streams that the
+      // legacy stream does not order against. DeviceAwareMemcpy synchronizes
+      // its own stream, so the bytes are there before the buffer is handed on.
+      ctp::DeviceAwareMemcpy(device_ptr, src, this_size);
       blob_data.alloc_id_ = gpu_alloc_id;
       blob_data.off_ = reinterpret_cast<clio::run::u64>(device_ptr);
       dataset->pending_gpu_buffers.push_back({/*gpu_id=*/0, gpu_alloc_id});

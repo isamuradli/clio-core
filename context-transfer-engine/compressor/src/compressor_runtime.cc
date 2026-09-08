@@ -4206,8 +4206,26 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
                  stored_shuffle, decompressed_size);
             success = false;
           } else {
-            ctp::GpuApi::Memcpy(codec_dst, scratch,
-                                decompressed_size);
+            // DeviceAwareMemcpy, NOT GpuApi::Memcpy. This is a DEVICE-TO-DEVICE
+            // copy, and cudaMemcpy performs NO host-side synchronization for
+            // D2D (CUDA "API synchronization behavior", case 4) -- it returns
+            // with the copy possibly still in flight on the legacy default
+            // stream. Two things then race it:
+            //
+            //   * the FreeGpuBackend below releases `scratch`, the copy's
+            //     SOURCE. With the device block pool that block is immediately
+            //     handed to another worker, which can overwrite it mid-copy.
+            //   * DequantizeDevice reads `codec_dst`, the DESTINATION, and
+            //     launches on DeviceStatsStream -- created
+            //     cudaStreamNonBlocking, so it is NOT ordered against the
+            //     legacy stream and can read bytes the copy has not written.
+            //
+            // DeviceAwareMemcpy issues it on a thread-local non-blocking stream
+            // and synchronizes that stream, so the copy is complete before this
+            // returns and both hazards close. The same reasoning is already
+            // recorded in the VPIC in-situ adapter, which avoids
+            // GpuApi::Memcpy for D2D for exactly this reason.
+            ctp::DeviceAwareMemcpy(codec_dst, scratch, decompressed_size);
           }
           if (!scratch_alloc.IsNull()) {
             CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, scratch_alloc);
