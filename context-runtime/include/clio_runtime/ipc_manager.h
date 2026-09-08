@@ -1122,10 +1122,14 @@ class IpcManager {
     if (gpu_ipc_) {
       size_t ngpu = gpu_ipc_->GetGpuQueueCount();
       for (size_t g = 0; g < ngpu; ++g) {
-        if (const auto *backend = gpu_ipc_->FindClientBackend(
-                static_cast<u32>(g), shm_ptr.alloc_id_)) {
+        // By value: the record used to come back as a pointer into the
+        // registry's map, which a concurrent UnregisterClientBackend could
+        // erase between the lookup and the dereference below.
+        typename gpu::IpcManager::ClientBackend backend;
+        if (gpu_ipc_->FindClientBackend(static_cast<u32>(g), shm_ptr.alloc_id_,
+                                        &backend)) {
           return ctp::ipc::FullPtr<T>(
-              reinterpret_cast<T *>(backend->device_ptr));
+              reinterpret_cast<T *>(backend.device_ptr));
         }
       }
     }
@@ -1403,6 +1407,9 @@ class IpcManager {
 
   /** Unregister and free a previously allocated GPU backend. */
   void FreeGpuBackend(u32 gpu_id, const ctp::ipc::AllocatorId &alloc_id);
+
+  /** Release every device block parked in the reuse pool. */
+  void DrainGpuBlockPool();
 #endif
 
   /**
@@ -1795,9 +1802,52 @@ class IpcManager {
     char *base = nullptr;
     gpu::IpcManager::MemKind kind = gpu::IpcManager::MemKind::kPinnedHost;
     bool in_process = false;
+    // What the block was allocated AS, so FreeGpuBackend can return it to the
+    // right pool class. The size is not recoverable from the pointer.
+    size_t bytes = 0;
+    u32 gpu_id = 0;
   };
   std::unordered_map<u64, OwnedGpuBackend> owned_gpu_backends_;
   std::mutex owned_gpu_backends_mutex_;
+
+  // ---- Device block pool ----
+  //
+  // The device allocation itself, kept for reuse instead of being handed back
+  // to the driver. cudaMalloc and cudaFree both synchronize against the
+  // device, and the compressor calls this pair SEVENTEEN times per chunk --
+  // measured on vpic/smoke at 17.1 allocations and 17.0 frees for one 2 MiB
+  // buffer, 1.28 ms and 1.01 ms of thread time each. The sizes repeat exactly
+  // (the chunk, the codec's worst case, the quantized buffer), so an
+  // exact-size free list hits ~99% of the time and eleven classes cover a run.
+  //
+  // ONLY the raw memory is recycled. A fresh AllocatorId is minted and
+  // registered on every allocation exactly as before, so an id that outlives
+  // its FreeGpuBackend still resolves to nothing rather than silently landing
+  // on whoever holds the block now -- reusing ids would turn a use-after-free
+  // from a clean failure into corruption.
+  //
+  // Keyed (gpu_id << 56) | (kind << 48) | bytes, so a block is only ever
+  // reused for the same device, kind and exact size. Blocks of 2^48 bytes or
+  // more are not pooled, which is what makes that packing lossless.
+  std::unordered_map<u64, std::vector<char *>> gpu_block_pool_;
+  std::mutex gpu_block_pool_mutex_;
+  // Bytes currently parked in gpu_block_pool_, and the ceiling on that.
+  // CLIO_GPU_BLOCK_POOL_MB sets the ceiling; 0 disables pooling entirely and
+  // restores the previous allocate-and-free-every-time behaviour exactly.
+  size_t gpu_block_pool_bytes_ = 0;
+  size_t gpu_block_pool_cap_bytes_ = 0;
+  bool gpu_block_pool_cap_read_ = false;
+
+  /** Pool ceiling in bytes, read once from CLIO_GPU_BLOCK_POOL_MB.
+   *  Callers must already hold gpu_block_pool_mutex_. */
+  size_t GpuBlockPoolCap();
+  /** Claim a parked block of this exact device/kind/size, or nullptr. */
+  char *GpuBlockPoolTake(u32 gpu_id, gpu::IpcManager::MemKind kind,
+                         size_t bytes);
+  /** Park a block for reuse. False when the pool is full or disabled, in
+   *  which case the caller must free it itself. */
+  bool GpuBlockPoolGive(u32 gpu_id, gpu::IpcManager::MemKind kind,
+                        size_t bytes, char *base);
 #elif CTP_IS_HOST
   /** Layout placeholders — same rule as gpu_ipc_placeholder_ below, and the
    *  same reason. These members sit BEFORE hostfile_map_, so omitting them in
@@ -1817,6 +1867,14 @@ class IpcManager {
    *  gpu_ipc_manager.h, whose include is guarded the same way. */
   std::unordered_map<u64, void *> owned_gpu_backends_placeholder_;
   std::mutex owned_gpu_backends_mutex_placeholder_;
+  // Stand-ins for the device block pool above, on the same layout rule: the
+  // map's layout does not depend on its mapped_type, and the rest are the
+  // same types in the same order.
+  std::unordered_map<u64, void *> gpu_block_pool_placeholder_;
+  std::mutex gpu_block_pool_mutex_placeholder_;
+  size_t gpu_block_pool_bytes_placeholder_ = 0;
+  size_t gpu_block_pool_cap_bytes_placeholder_ = 0;
+  bool gpu_block_pool_cap_read_placeholder_ = false;
 #endif
 
   // Pending response archives (client-side, keyed by net_key)

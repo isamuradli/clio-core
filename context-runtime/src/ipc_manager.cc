@@ -2160,6 +2160,12 @@ size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
 }
 
 IpcManager::~IpcManager() {
+#if CTP_IS_HOST && (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL)
+  // Blocks parked for reuse are still live device allocations, so they go back
+  // to the driver here rather than riding on context teardown -- otherwise
+  // every leak checker sees the pool as a leak.
+  DrainGpuBlockPool();
+#endif
 #if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
   ReportRuntimeLeaks("~IpcManager");
 #endif
@@ -3856,18 +3862,25 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
   result.SetNull();
   if (out_base) *out_base = nullptr;
 
-  char *base = nullptr;
-  switch (kind) {
-    case gpu::IpcManager::MemKind::kPinnedHost:
-      base = ctp::GpuApi::MallocHost<char>(bytes);
-      break;
-    case gpu::IpcManager::MemKind::kManagedUvm:
-      base = ctp::GpuApi::MallocManaged<char>(bytes);
-      break;
-    case gpu::IpcManager::MemKind::kDeviceMem:
-      ctp::GpuApi::SetDevice(static_cast<int>(gpu_id));
-      base = ctp::GpuApi::Malloc<char>(bytes);
-      break;
+  // A block of this exact size, kind and device may already be parked from an
+  // earlier free. Reusing it skips a cudaMalloc, which is a synchronizing call
+  // -- 132 us on average in the compressor's steady state, seventeen times a
+  // chunk. Everything after this point is unchanged: the id is still fresh and
+  // still registered, so only the memory is recycled, never the identity.
+  char *base = GpuBlockPoolTake(gpu_id, kind, bytes);
+  if (base == nullptr) {
+    switch (kind) {
+      case gpu::IpcManager::MemKind::kPinnedHost:
+        base = ctp::GpuApi::MallocHost<char>(bytes);
+        break;
+      case gpu::IpcManager::MemKind::kManagedUvm:
+        base = ctp::GpuApi::MallocManaged<char>(bytes);
+        break;
+      case gpu::IpcManager::MemKind::kDeviceMem:
+        ctp::GpuApi::SetDevice(static_cast<int>(gpu_id));
+        base = ctp::GpuApi::Malloc<char>(bytes);
+        break;
+    }
   }
   if (!base) {
     HLOG(kError, "AllocateAndRegisterGpuBackend: alloc failed (kind={}, "
@@ -3968,7 +3981,8 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     u64 key = (static_cast<u64>(alloc_id.major_) << 32) |
               static_cast<u64>(alloc_id.minor_);
     std::lock_guard<std::mutex> lk(owned_gpu_backends_mutex_);
-    owned_gpu_backends_[key] = OwnedGpuBackend{base, kind, registered_in_process};
+    owned_gpu_backends_[key] =
+        OwnedGpuBackend{base, kind, registered_in_process, bytes, gpu_id};
   }
 
   result = alloc_id;
@@ -4049,10 +4063,92 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
   // with — the same dispatch AllocateAndRegisterGpuBackend's own failure paths
   // use. Without this the buffer leaked for the process lifetime: the
   // registration entry went away and the device memory did not.
+  //
+  // Park it for reuse instead, when it is in-process (the only case this
+  // function frees at all) and the pool has room. The backend registration is
+  // already gone by here, so nothing can resolve to this block until a later
+  // AllocateAndRegisterGpuBackend hands it out under a NEW id.
+  if (owned.in_process &&
+      GpuBlockPoolGive(owned.gpu_id, owned.kind, owned.bytes, owned.base)) {
+    return;
+  }
   if (owned.kind == gpu::IpcManager::MemKind::kPinnedHost) {
     ctp::GpuApi::FreeHost(owned.base);
   } else {
     ctp::GpuApi::Free(owned.base);
+  }
+}
+
+/** Pack (device, kind, size) into the pool's key. */
+static inline clio::run::u64 GpuBlockPoolKey(clio::run::u32 gpu_id,
+                                             gpu::IpcManager::MemKind kind,
+                                             size_t bytes) {
+  return (static_cast<clio::run::u64>(gpu_id & 0xff) << 56) |
+         (static_cast<clio::run::u64>(static_cast<int>(kind) & 0xff) << 48) |
+         static_cast<clio::run::u64>(bytes);
+}
+
+/** The pool ceiling, from CLIO_GPU_BLOCK_POOL_MB. 0 disables pooling. */
+size_t IpcManager::GpuBlockPoolCap() {
+  if (!gpu_block_pool_cap_read_) {
+    // 1 GiB by default. The compressor's working set is 17 blocks per in-flight
+    // chunk across a handful of exact sizes, so this holds every class of a
+    // 4-worker run at an 8 MiB chunk with room over; the ceiling exists to
+    // bound a workload whose sizes do NOT repeat, where pooling would
+    // otherwise accumulate a class per distinct size and never reuse any.
+    double mb = 1024.0;
+    if (const char *e = std::getenv("CLIO_GPU_BLOCK_POOL_MB")) {
+      char *end = nullptr;
+      double v = std::strtod(e, &end);
+      if (end != e && v >= 0.0) mb = v;
+    }
+    gpu_block_pool_cap_bytes_ = static_cast<size_t>(mb * 1024.0 * 1024.0);
+    gpu_block_pool_cap_read_ = true;
+  }
+  return gpu_block_pool_cap_bytes_;
+}
+
+char *IpcManager::GpuBlockPoolTake(u32 gpu_id, gpu::IpcManager::MemKind kind,
+                                   size_t bytes) {
+  if (bytes == 0 || bytes >= (1ULL << 48)) return nullptr;
+  std::lock_guard<std::mutex> lk(gpu_block_pool_mutex_);
+  if (GpuBlockPoolCap() == 0) return nullptr;
+  auto it = gpu_block_pool_.find(GpuBlockPoolKey(gpu_id, kind, bytes));
+  if (it == gpu_block_pool_.end() || it->second.empty()) return nullptr;
+  char *p = it->second.back();
+  it->second.pop_back();
+  gpu_block_pool_bytes_ -= bytes;
+  return p;
+}
+
+bool IpcManager::GpuBlockPoolGive(u32 gpu_id, gpu::IpcManager::MemKind kind,
+                                  size_t bytes, char *base) {
+  if (base == nullptr || bytes == 0 || bytes >= (1ULL << 48)) return false;
+  std::lock_guard<std::mutex> lk(gpu_block_pool_mutex_);
+  const size_t cap = GpuBlockPoolCap();
+  if (cap == 0 || gpu_block_pool_bytes_ + bytes > cap) return false;
+  gpu_block_pool_[GpuBlockPoolKey(gpu_id, kind, bytes)].push_back(base);
+  gpu_block_pool_bytes_ += bytes;
+  return true;
+}
+
+void IpcManager::DrainGpuBlockPool() {
+  std::unordered_map<u64, std::vector<char *>> taken;
+  {
+    std::lock_guard<std::mutex> lk(gpu_block_pool_mutex_);
+    taken.swap(gpu_block_pool_);
+    gpu_block_pool_bytes_ = 0;
+  }
+  for (auto &kv : taken) {
+    const auto kind = static_cast<gpu::IpcManager::MemKind>(
+        static_cast<int>((kv.first >> 48) & 0xff));
+    for (char *p : kv.second) {
+      if (kind == gpu::IpcManager::MemKind::kPinnedHost) {
+        ctp::GpuApi::FreeHost(p);
+      } else {
+        ctp::GpuApi::Free(p);
+      }
+    }
   }
 }
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
