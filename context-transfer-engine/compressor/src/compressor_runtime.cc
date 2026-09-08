@@ -1348,6 +1348,25 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // (statistics, ranking, quantize, shuffle, codec choice) keys off the
     // residency of this pointer, so a device pointer here puts the whole
     // pipeline on the device path.
+    // The HOST bytes, kept for the selection log's checksum below.
+    //
+    // That checksum hashes the chunk on the CPU, and once staging moved
+    // chunk_data to the device it had no host copy to hash -- so it copied the
+    // whole chunk BACK, 2 MiB per chunk, purely to feed an FNV-1a loop. That
+    // D2H exactly cancels the H2D a few lines below it, and measured 366 ms
+    // across a 640-chunk vpic run: 46% of all asynchronous transfer time, on a
+    // diagnostic.
+    //
+    // The bytes it wants are the ones staging is about to read. Remembering the
+    // source pointer costs nothing and removes the copy entirely, and the
+    // checksum is over the same bytes either way, so its VALUE is unchanged.
+    // Null when the chunk arrived device-resident (an in-situ adapter): there
+    // is no host copy then, and the checksum still stages one down.
+    const void *host_chunk_src =
+        (chunk_data != nullptr && !ctp::IsDevicePointer(chunk_data))
+            ? chunk_data
+            : nullptr;
+
     ctp::ipc::AllocatorId h2d_alloc;
     struct H2dGuard {
       ctp::ipc::AllocatorId *id;
@@ -1750,9 +1769,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       unsigned long long checksum = 0;
       if (SelectionLogEnabled() && chunk_data && chunk_size > 0) {
         std::vector<char> staged;
-        const unsigned char *p =
-            static_cast<const unsigned char *>(chunk_data);
-        if (ctp::IsDevicePointer(chunk_data)) {
+        // Prefer the host bytes staging was fed, when there were any: the
+        // device copy holds the same bytes, so hashing the source avoids a
+        // full-chunk D2H per chunk without changing the checksum. See
+        // host_chunk_src.
+        const unsigned char *p = static_cast<const unsigned char *>(
+            host_chunk_src != nullptr ? host_chunk_src : chunk_data);
+        if (host_chunk_src == nullptr && ctp::IsDevicePointer(chunk_data)) {
           staged.resize(chunk_size);
           ctp::DeviceAwareMemcpy(staged.data(), chunk_data, chunk_size);
           p = reinterpret_cast<const unsigned char *>(staged.data());
