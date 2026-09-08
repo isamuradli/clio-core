@@ -15,6 +15,7 @@
  * adopted result's total (header + payload), so the two must agree exactly.
  */
 #include "simple_test.h"
+#include "device_chunk.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -101,13 +102,14 @@ TEST_CASE("Exploration stores exactly what the adopted codec needs",
   // the codecs differ enough for exploration to have something to adopt.
   const size_t kElems = 256 * 1024;
   const size_t kBytes = kElems * sizeof(float);
-  auto buf = CLIO_IPC->AllocateBuffer(kBytes);
-  REQUIRE(!buf.IsNull());
-  auto *fp = reinterpret_cast<float *>(buf.ptr_);
+  // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+  std::vector<float> host_chunk(kElems);
   for (size_t i = 0; i < kElems; ++i) {
-    fp[i] = std::sin(static_cast<double>(i) * 0.001) * 100.0;
+    host_chunk[i] = std::sin(static_cast<double>(i) * 0.001) * 100.0;
   }
-  ctp::ipc::ShmPtr<> blob_data = buf.shm_.template Cast<void>();
+  clio::cte::compressor::test::DeviceChunk chunk;
+  REQUIRE(chunk.Fill(host_chunk.data(), kBytes));
+  ctp::ipc::ShmPtr<> blob_data = chunk.shm().template Cast<void>();
 
   clio::cte::core::Context ctx;
   ctx.dynamic_compress_ = 2;  // DYNAMIC: let the model choose
@@ -154,7 +156,7 @@ TEST_CASE("Exploration stores exactly what the adopted codec needs",
   auto *got = reinterpret_cast<float *>(get_buf.ptr_);
   size_t bad = 0;
   for (size_t i = 0; i < kElems; ++i) {
-    if (std::memcmp(&got[i], &fp[i], sizeof(float)) != 0) ++bad;
+    if (std::memcmp(&got[i], &host_chunk[i], sizeof(float)) != 0) ++bad;
   }
   INFO(std::to_string(bad) + " mismatching floats after round trip");
   REQUIRE(bad == 0);

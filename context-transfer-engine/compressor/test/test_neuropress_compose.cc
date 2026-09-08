@@ -32,6 +32,7 @@
  */
 
 #include "simple_test.h"
+#include "device_chunk.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -160,13 +161,14 @@ TEST_CASE("Compose YAML alone turns NeuroPress selection on",
   // trained on. A pattern of bytes would rank differently and prove less.
   const size_t kElems = 256 * 1024;
   const size_t kBytes = kElems * sizeof(float);
-  auto buffer = CLIO_IPC->AllocateBuffer(kBytes);
-  REQUIRE(!buffer.IsNull());
-  auto *f = reinterpret_cast<float *>(buffer.ptr_);
+  // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+  std::vector<float> host_chunk(kElems);
   for (size_t i = 0; i < kElems; ++i) {
-    f[i] = static_cast<float>((i % 512) * 0.015625);
+    host_chunk[i] = static_cast<float>((i % 512) * 0.015625);
   }
-  ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
+  clio::cte::compressor::test::DeviceChunk chunk;
+  REQUIRE(chunk.Fill(host_chunk.data(), kBytes));
+  ctp::ipc::ShmPtr<> blob_data = chunk.shm().template Cast<void>();
 
   clio::cte::core::Context ctx;
 #if CTP_ENABLE_COMPRESS

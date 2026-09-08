@@ -64,6 +64,33 @@ static bool EvoOnDevice(const float *b1, const float *b2, size_t n,
   return ok;
 }
 
+/** A device-resident copy of a host block, owned for the scope.
+ *
+ * BlockEvolutionTracker::Observe refuses a host-resident chunk outright
+ * (block_evolution.cc): the metric feeds selection, so computing it on the CPU
+ * would silently change what the model is told. Same reason EvoOnDevice above
+ * exists -- this is its counterpart for the state-machine case, which drives
+ * the tracker rather than calling the kernel directly.
+ */
+class DevBlock {
+ public:
+  explicit DevBlock(const std::vector<float> &host)
+      : bytes_(host.size() * sizeof(float)) {
+    ptr_ = ctp::GpuApi::Malloc<float>(bytes_);
+    if (ptr_ != nullptr) ctp::GpuApi::Memcpy(ptr_, host.data(), bytes_);
+  }
+  ~DevBlock() {
+    if (ptr_ != nullptr) ctp::GpuApi::Free(ptr_);
+  }
+  DevBlock(const DevBlock &) = delete;
+  DevBlock &operator=(const DevBlock &) = delete;
+  const float *get() const { return ptr_; }
+
+ private:
+  size_t bytes_ = 0;
+  float *ptr_ = nullptr;
+};
+
 TEST_CASE("BlockEvolutionHostClosedForm") {
   const size_t n = 4096;
 
@@ -167,18 +194,22 @@ TEST_CASE("BlockEvolutionNonFinite") {
 }
 
 TEST_CASE("BlockEvolutionTrackerStateMachine") {
-  // Host chunks, so this case runs on every build.
+  // DEVICE chunks: Observe() refuses host memory, so a host block would make
+  // every call below return false and assert nothing. See DevBlock.
   const size_t n = 512;
   ctp::BlockEvolutionTracker tracker(/*sample_interval=*/10);
 
   auto t0 = Constant(n, 1.0f);
   auto t10 = Constant(n, 2.0f);
   const size_t bytes = n * sizeof(float);
+  DevBlock d_t0(t0), d_t10(t10);
+  REQUIRE(d_t0.get() != nullptr);
+  REQUIRE(d_t10.get() != nullptr);
 
   ctp::BlockEvolution e;
 
   // First sample: retained, no value yet.
-  REQUIRE_FALSE(tracker.Observe("position/chunk_0", 0, t0.data(), bytes,
+  REQUIRE_FALSE(tracker.Observe("position/chunk_0", 0, d_t0.get(), bytes,
                                 ctp::DataType::FLOAT32, nullptr, &e));
   REQUIRE(e.status == ctp::BlockEvolutionStatus::kFirstTimestep);
   REQUIRE(tracker.tracked_blocks() == 1);
@@ -187,12 +218,12 @@ TEST_CASE("BlockEvolutionTrackerStateMachine") {
   // Off-grid timesteps are skipped and, importantly, do NOT refresh the
   // retained block -- otherwise the next comparison would span 1 step
   // instead of the configured 10.
-  REQUIRE_FALSE(tracker.Observe("position/chunk_0", 3, t10.data(), bytes,
+  REQUIRE_FALSE(tracker.Observe("position/chunk_0", 3, d_t10.get(), bytes,
                                 ctp::DataType::FLOAT32, nullptr, &e));
   REQUIRE(e.status == ctp::BlockEvolutionStatus::kNotSampled);
 
   // On-grid: compares against t=0, not against t=3.
-  REQUIRE(tracker.Observe("position/chunk_0", 10, t10.data(), bytes,
+  REQUIRE(tracker.Observe("position/chunk_0", 10, d_t10.get(), bytes,
                           ctp::DataType::FLOAT32, nullptr, &e));
   REQUIRE(e.status == ctp::BlockEvolutionStatus::kOk);
   REQUIRE(e.delta_t == 10);
@@ -202,25 +233,27 @@ TEST_CASE("BlockEvolutionTrackerStateMachine") {
   // The retained block advanced to t=10, so t=20 against an unchanged field
   // is zero evolution -- proving the comparison is against t=10 and not
   // still against t=0.
-  REQUIRE(tracker.Observe("position/chunk_0", 20, t10.data(), bytes,
+  REQUIRE(tracker.Observe("position/chunk_0", 20, d_t10.get(), bytes,
                           ctp::DataType::FLOAT32, nullptr, &e));
   REQUIRE(e.delta_t == 10);
   REQUIRE(e.normalized_change == 0.0);
 
   // A resized block is not differenced against the old one.
   auto grown = Constant(n * 2, 2.0f);
-  REQUIRE_FALSE(tracker.Observe("position/chunk_0", 30, grown.data(),
+  DevBlock d_grown(grown);
+  REQUIRE(d_grown.get() != nullptr);
+  REQUIRE_FALSE(tracker.Observe("position/chunk_0", 30, d_grown.get(),
                                 bytes * 2, ctp::DataType::FLOAT32, nullptr,
                                 &e));
   REQUIRE(e.status == ctp::BlockEvolutionStatus::kSizeMismatch);
   // ...but it is retained at the new size, so the series resumes.
   REQUIRE(tracker.retained_bytes() == bytes * 2);
-  REQUIRE(tracker.Observe("position/chunk_0", 40, grown.data(), bytes * 2,
+  REQUIRE(tracker.Observe("position/chunk_0", 40, d_grown.get(), bytes * 2,
                           ctp::DataType::FLOAT32, nullptr, &e));
   REQUIRE(e.status == ctp::BlockEvolutionStatus::kOk);
 
   // Distinct blocks are tracked independently.
-  REQUIRE_FALSE(tracker.Observe("position/chunk_1", 40, t0.data(), bytes,
+  REQUIRE_FALSE(tracker.Observe("position/chunk_1", 40, d_t0.get(), bytes,
                                 ctp::DataType::FLOAT32, nullptr, &e));
   REQUIRE(e.status == ctp::BlockEvolutionStatus::kFirstTimestep);
   REQUIRE(tracker.tracked_blocks() == 2);

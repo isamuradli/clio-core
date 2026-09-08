@@ -186,6 +186,10 @@ add_test(NAME compressor_dynamic_schedule
 
 add_test(NAME compressor_dynamic_neuropress
     COMMAND test_compressor_functional "[neuropress][693]")
+# Sweeps in the residency case, whose host arm needs staging (STAGE_H2D copies
+# the chunk UP to the device -- not a host fallback).
+set_tests_properties(compressor_dynamic_neuropress PROPERTIES
+    ENVIRONMENT "CLIO_NEUROPRESS_STAGE_H2D=1")
 
 # Exploration gets its own entry as well as being swept up by the tag filter
 # above: it is the only case that exercises the K-way search, the
@@ -203,6 +207,10 @@ add_test(NAME compressor_exploration
 # bytes rather than driving the two residencies.
 add_test(NAME compressor_residency_invariance
     COMMAND test_compressor_functional "[residency]")
+# Sweeps in the residency case, whose host arm needs staging (STAGE_H2D copies
+# the chunk UP to the device -- not a host fallback).
+set_tests_properties(compressor_residency_invariance PROPERTIES
+    ENVIRONMENT "CLIO_NEUROPRESS_STAGE_H2D=1")
 
 add_test(NAME compressor_nvcomp_gpu_roundtrip
     COMMAND test_compressor_functional "[nvcomp][gpu]")

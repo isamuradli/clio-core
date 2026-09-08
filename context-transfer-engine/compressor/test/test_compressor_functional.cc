@@ -47,6 +47,7 @@
  */
 
 #include "simple_test.h"
+#include "device_chunk.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -412,10 +413,10 @@ TEST_CASE("Dynamic Schedule Compression", "[compressor][functional][dynamic]") {
 
   auto test_data = GenerateTestData(64 * 1024, "text");
 
-  auto shm_buffer = fixture.AllocateAndCopyData(test_data);
-  REQUIRE(!shm_buffer.IsNull());
-
-  ctp::ipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
+  // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+  clio::cte::compressor::test::DeviceChunk chunk;
+  REQUIRE(chunk.Fill(test_data.data(), test_data.size()));
+  ctp::ipc::ShmPtr<> blob_data = chunk.shm().template Cast<void>();
 
   Context context;
   context.dynamic_compress_ = 0;  // Enable dynamic compression selection
@@ -438,7 +439,6 @@ TEST_CASE("Dynamic Schedule Compression", "[compressor][functional][dynamic]") {
   INFO("DynamicSchedule selected compression library: " << task->context_.compress_lib_);
   INFO("Tier score: " << task->tier_score_);
 
-  CLIO_IPC->FreeBuffer(shm_buffer);
 }
 
 /**
@@ -499,9 +499,9 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
   std::set<int> observed_libs;
   for (const auto &trial : trials) {
     auto test_data = GenerateTestData(trial.size, trial.pattern);
-    auto shm_buffer = fixture.AllocateAndCopyData(test_data);
-    REQUIRE(!shm_buffer.IsNull());
-    ctp::ipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
+    clio::cte::compressor::test::DeviceChunk chunk;
+    REQUIRE(chunk.Fill(test_data.data(), test_data.size()));
+    ctp::ipc::ShmPtr<> blob_data = chunk.shm().template Cast<void>();
 
     Context context;
     context.dynamic_compress_ = 0;  // Dynamic mode
@@ -516,7 +516,6 @@ TEST_CASE("DynamicSchedule - NeuroPress reaches the wider action space",
     REQUIRE(task->return_code_ == 0);
     observed_libs.insert(task->context_.compress_lib_);
 
-    CLIO_IPC->FreeBuffer(shm_buffer);
   }
 
   bool reached_wider_action_space = false;
@@ -583,9 +582,10 @@ TEST_CASE("Exploration - adopted winners still round-trip",
 
   for (const auto &trial : trials) {
     const auto original = GenerateTestData(trial.size, trial.pattern);
-    auto put_buffer = fixture.AllocateAndCopyData(original);
-    REQUIRE(!put_buffer.IsNull());
-    ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+    // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+    clio::cte::compressor::test::DeviceChunk put_chunk;
+    REQUIRE(put_chunk.Fill(original.data(), original.size()));
+    ctp::ipc::ShmPtr<> put_blob_data = put_chunk.shm().template Cast<void>();
 
     const std::string blob_name = "explore_blob_" + trial.pattern + "_" +
                                   std::to_string(trial.size);
@@ -600,7 +600,6 @@ TEST_CASE("Exploration - adopted winners still round-trip",
         fixture.core_pool_id_);
     task.Wait();
     REQUIRE(task->return_code_ == 0);
-    CLIO_IPC->FreeBuffer(put_buffer);
 
     // THE ACTUAL CHECK: read the stored blob back. If exploration adopted an
     // alternative, these are that alternative's bytes under a header it also

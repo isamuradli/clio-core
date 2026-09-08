@@ -12,6 +12,7 @@
  * and nn_action matches the preset the blob was stored under.
  */
 #include "simple_test.h"
+#include "device_chunk.h"
 
 #include <cmath>
 #include <cstdint>
@@ -153,9 +154,11 @@ TEST_CASE("Online learning is shown the config that actually ran",
   std::vector<uint32_t> stored_preset;
 
   for (int shape = 0; shape < kShapes; ++shape) {
-    auto buf = CLIO_IPC->AllocateBuffer(kBytes);
-    REQUIRE(!buf.IsNull());
-    FillChunk(reinterpret_cast<float *>(buf.ptr_), kElems, shape);
+    // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+    std::vector<float> host_chunk(kElems);
+    FillChunk(host_chunk.data(), kElems, shape);
+    clio::cte::compressor::test::DeviceChunk chunk;
+    REQUIRE(chunk.Fill(host_chunk.data(), kBytes));
 
     clio::cte::core::Context ctx;
     ctx.dynamic_compress_ = 2;  // DYNAMIC: let the model choose
@@ -166,7 +169,7 @@ TEST_CASE("Online learning is shown the config that actually ran",
     auto sched = compressor.AsyncDynamicSchedule(
         clio::run::PoolQuery::Local(), tag_id,
         "np_train_blob_" + std::to_string(shape),
-        /*offset=*/0, kBytes, buf.shm_.template Cast<void>(), -1.0f, ctx, 0,
+        /*offset=*/0, kBytes, chunk.shm().template Cast<void>(), -1.0f, ctx, 0,
         clio::run::PoolId(513, 0));
     sched.Wait();
     REQUIRE(sched->GetReturnCode() == 0);

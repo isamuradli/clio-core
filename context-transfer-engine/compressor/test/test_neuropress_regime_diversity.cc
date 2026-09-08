@@ -22,6 +22,7 @@
  * trained model's own answer rather than a product of the regime before it.
  */
 #include "simple_test.h"
+#include "device_chunk.h"
 
 #include <algorithm>
 #include <cmath>
@@ -206,10 +207,12 @@ TEST_CASE("Diverse statistics drive diverse codec selection",
 
   for (int ri = 0; ri < kNumRegimes; ++ri) {
     for (int k = 0; k < reps; ++k) {
-      auto buf = CLIO_IPC->AllocateBuffer(kBytes);
-      REQUIRE(!buf.IsNull());
+      // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
       Rng rng(0x9E3779B9ull + 7919ull * (ri * 64 + k));
-      kRegimes[ri].fill(reinterpret_cast<float *>(buf.ptr_), kElems, rng);
+      std::vector<float> host_chunk(kElems);
+      kRegimes[ri].fill(host_chunk.data(), kElems, rng);
+      clio::cte::compressor::test::DeviceChunk chunk;
+      REQUIRE(chunk.Fill(host_chunk.data(), kBytes));
 
       clio::cte::core::Context ctx;
       ctx.dynamic_compress_ = 2;
@@ -217,7 +220,7 @@ TEST_CASE("Diverse statistics drive diverse codec selection",
       auto sched = compressor.AsyncDynamicSchedule(
           clio::run::PoolQuery::Local(), tag_id,
           "np_reg_" + std::to_string(ri) + "_" + std::to_string(k),
-          /*offset=*/0, kBytes, buf.shm_.template Cast<void>(), -1.0f, ctx, 0,
+          /*offset=*/0, kBytes, chunk.shm().template Cast<void>(), -1.0f, ctx, 0,
           clio::run::PoolId(513, 0));
       sched.Wait();
       REQUIRE(sched->GetReturnCode() == 0);

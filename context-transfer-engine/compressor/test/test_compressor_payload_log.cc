@@ -34,6 +34,7 @@
  */
 
 #include "simple_test.h"
+#include "device_chunk.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -203,9 +204,9 @@ TEST_CASE("Payload log reports the stored bytes, not the primary's",
 
   for (size_t i = 0; i < trials.size(); ++i) {
     const auto data = GenerateTestData(trials[i].size, trials[i].pattern);
-    auto buf = CLIO_IPC->AllocateBuffer(data.size());
-    REQUIRE(!buf.IsNull());
-    std::memcpy(buf.ptr_, data.data(), data.size());
+    // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+    clio::cte::compressor::test::DeviceChunk chunk;
+    REQUIRE(chunk.Fill(data.data(), data.size()));
 
     const std::string blob = std::string("payload_blob_") + std::to_string(i);
     Context ctx;
@@ -214,12 +215,11 @@ TEST_CASE("Payload log reports the stored bytes, not the primary's",
 
     auto task = client.AsyncDynamicSchedule(
         clio::run::PoolQuery::Local(), tag_id, blob, 0, data.size(),
-        buf.shm_.template Cast<void>(), 0.5f, ctx, 0, core_pool);
+        chunk.shm().template Cast<void>(), 0.5f, ctx, 0, core_pool);
     task.Wait();
     REQUIRE(task->return_code_ == 0);
     if (task->context_.actual_compressed_size_ > 0)
       stored[blob] = task->context_.actual_compressed_size_;
-    CLIO_IPC->FreeBuffer(buf);
   }
 
   const auto rows = ReadPayloadLog(payload_path);

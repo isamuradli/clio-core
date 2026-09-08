@@ -18,6 +18,7 @@
  * falling error proves nothing -- it could be later chunks being easier.
  */
 #include "simple_test.h"
+#include "device_chunk.h"
 
 #include <cmath>
 #include <cstdint>
@@ -204,10 +205,11 @@ TEST_CASE("Online learning improves prediction accuracy across phases",
   for (int phase = 0; phase < kPhases; ++phase) {
     for (int ci = 0; ci < kChunksPerPhase; ++ci) {
       const int idx = phase * kChunksPerPhase + ci;
-      auto buf = CLIO_IPC->AllocateBuffer(kBytes);
-      REQUIRE(!buf.IsNull());
-      FillChunk(reinterpret_cast<float *>(buf.ptr_), kElems, phase,
-                0x9E3779B9u + 7919u * idx);
+      // DEVICE-RESIDENT input: NeuroPress preprocessing is CUDA-only. See device_chunk.h.
+      std::vector<float> host_chunk(kElems);
+      FillChunk(host_chunk.data(), kElems, phase, 0x9E3779B9u + 7919u * idx);
+      clio::cte::compressor::test::DeviceChunk chunk;
+      REQUIRE(chunk.Fill(host_chunk.data(), kBytes));
 
       clio::cte::core::Context ctx;
       ctx.dynamic_compress_ = 2;  // DYNAMIC: let the model choose
@@ -216,7 +218,7 @@ TEST_CASE("Online learning improves prediction accuracy across phases",
       auto sched = compressor.AsyncDynamicSchedule(
           clio::run::PoolQuery::Local(), tag_id,
           "np_phase_blob_" + std::to_string(idx), /*offset=*/0, kBytes,
-          buf.shm_.template Cast<void>(), -1.0f, ctx, 0,
+          chunk.shm().template Cast<void>(), -1.0f, ctx, 0,
           clio::run::PoolId(513, 0));
       sched.Wait();
       REQUIRE(sched->GetReturnCode() == 0);
