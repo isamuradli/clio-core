@@ -208,6 +208,16 @@ inline bool NeuroPressStageH2D() {
   return on;
 }
 
+/** Hand Compress the copy DynamicSchedule already staged, instead of the host
+ *  buffer it came from. DEFAULT ON; 0 restores the second staging. */
+inline bool NeuroPressReuseStagedH2D() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_REUSE_STAGED_H2D");
+    return e == nullptr || (*e != '\0' && *e != '0');
+  }();
+  return on;
+}
+
 inline bool NeuroPressRequireDevice() {
   static const bool on = [] {
     const char *e = std::getenv("CLIO_NEUROPRESS_REQUIRE_DEVICE");
@@ -1618,10 +1628,44 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // after that block.
     bool stored_by_exploration = false;
 
+    // HAND COMPRESS THE COPY SELECTION ALREADY STAGED, rather than the host
+    // buffer it was made from.
+    //
+    // This passed task->blob_data_, so Compress re-read the host bytes and
+    // staged the SAME chunk up a second time (its own compress_h2d_alloc):
+    // two device allocations, two frees, and two full H2D copies per chunk
+    // where one would do. Measured on vpic/smoke at 2 MiB: the duplicate pair
+    // is 161 ms of cudaMalloc and 103 ms of synchronous H2D across a 640-chunk
+    // run, and the copy is the larger half of the two arms of `clio_s`.
+    //
+    // The lifetime already allows it and always did: this awaits the compress
+    // task below, and H2dGuard releases the staging only when this scope
+    // exits -- strictly after that await returns. Nothing else reads the
+    // buffer afterwards.
+    //
+    // The pointer travels by the SAME convention Compress uses to hand its
+    // device-resident OUTPUT back (see where compressed_shm_ptr is built): a
+    // GPU backend minted by this process carries its raw device pointer in
+    // off_, and ToFullPtr resolves it by PID or through the registered
+    // backend. Both routes apply because AsyncCompress is PoolQuery::Local()
+    // -- in-process, so CompressTask::SerializeStart's bulk transfer of
+    // blob_data_ never runs. A remote pool would need the host buffer.
+    //
+    // Untouched when nothing was staged: a chunk that arrived device-resident
+    // (an in-situ adapter) already had Compress skip its own staging, and a
+    // host chunk with staging disabled must keep reaching Compress as host
+    // memory.
+    ctp::ipc::ShmPtr<> compress_input = task->blob_data_;
+    if (NeuroPressReuseStagedH2D() && !h2d_alloc.IsNull() &&
+        chunk_data != nullptr) {
+      compress_input.alloc_id_ = h2d_alloc;
+      compress_input.off_ = reinterpret_cast<clio::run::u64>(chunk_data);
+    }
+
     // Now call Compress to perform compression (and PutBlob unless deferred)
     auto compress_task = client_.AsyncCompress(
         clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
-        task->offset_, task->size_, task->blob_data_, task->score_, context,
+        task->offset_, task->size_, compress_input, task->score_, context,
         task->flags_, task->core_pool_id_, defer_store);
     CLIO_CO_AWAIT(compress_task);
 
