@@ -51,6 +51,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "compress.h"
 
@@ -953,6 +956,65 @@ class NvComp : public Compressor {
     return v;
   }
 
+  // ---- Scratch reuse ----
+  //
+  // nvcomp asks for its scratch through the two callbacks below, and the
+  // manager is built per chunk, so every request is a fresh cudaMalloc and
+  // every release a cudaFree -- both of which synchronize against the device.
+  // The sizes are a property of the algorithm and the chunk size, not of the
+  // data, so they repeat exactly: an exploration sweep at K=31 on a 2 MiB VPIC
+  // chunk asks for the same handful of sizes 15 times per chunk, one of them
+  // 882 MiB. Measured there at 112,050 allocations still reaching the driver
+  // with the runtime's own block pool already on, because these never pass
+  // through it -- nvcomp.h is CTP, below context-runtime, and cannot reach
+  // IpcManager.
+  //
+  // The free callback is handed the SIZE, which is what makes an exact-size
+  // free list the natural shape here: no splitting, no best fit, no headers.
+  //
+  // CLIO_NVCOMP_SCRATCH_POOL_MB caps what may be parked; 0 disables reuse and
+  // restores allocate-and-free-every-time exactly.
+  static std::mutex &ScratchPoolMutex() {
+    static std::mutex m;
+    return m;
+  }
+  static std::unordered_map<size_t, std::vector<void *>> &ScratchPool() {
+    static std::unordered_map<size_t, std::vector<void *>> pool;
+    return pool;
+  }
+  static size_t &ScratchPoolBytes() {
+    static size_t bytes = 0;
+    return bytes;
+  }
+  static size_t ScratchPoolCap() {
+    static const size_t cap = [] {
+      double mb = 2048.0;
+      if (const char *e = std::getenv("CLIO_NVCOMP_SCRATCH_POOL_MB")) {
+        char *end = nullptr;
+        double v = std::strtod(e, &end);
+        if (end != e && v >= 0.0) mb = v;
+      }
+      return static_cast<size_t>(mb * 1024.0 * 1024.0);
+    }();
+    return cap;
+  }
+
+  /** Release every parked scratch block. Called on an allocation failure
+   *  before giving up, so the pool can never be the reason a compress runs
+   *  out of device memory -- it hands the driver everything it is holding and
+   *  lets the request try again. */
+  static void DrainScratchPool() {
+    std::unordered_map<size_t, std::vector<void *>> taken;
+    {
+      std::lock_guard<std::mutex> lk(ScratchPoolMutex());
+      taken.swap(ScratchPool());
+      ScratchPoolBytes() = 0;
+    }
+    for (auto &kv : taken) {
+      for (void *p : kv.second) cudaFree(p);
+    }
+  }
+
   /** nvcomp's own scratch allocator is cudaMallocAsync, whose failure is
    *  asynchronous -- it does not throw, so compress() reports success and
    *  writes an output no decompressor accepts. Synchronous cudaMalloc turns
@@ -963,14 +1025,37 @@ class NvComp : public Compressor {
     try {
       mgr->set_scratch_allocators(
           [](size_t n) -> void * {
-            void *p = nullptr;
-            if (cudaMalloc(&p, n) != cudaSuccess) {
-              ScratchOomFlag() = true;
-              return nullptr;
+            if (n != 0 && ScratchPoolCap() != 0) {
+              std::lock_guard<std::mutex> lk(ScratchPoolMutex());
+              auto it = ScratchPool().find(n);
+              if (it != ScratchPool().end() && !it->second.empty()) {
+                void *p = it->second.back();
+                it->second.pop_back();
+                ScratchPoolBytes() -= n;
+                return p;
+              }
             }
-            return p;
+            void *p = nullptr;
+            if (cudaMalloc(&p, n) == cudaSuccess) return p;
+            // Out of memory with blocks parked is not out of memory: give
+            // them all back and ask once more before reporting failure.
+            DrainScratchPool();
+            if (cudaMalloc(&p, n) == cudaSuccess) return p;
+            ScratchOomFlag() = true;
+            return nullptr;
           },
-          [](void *p, size_t) { if (p) cudaFree(p); });
+          [](void *p, size_t n) {
+            if (!p) return;
+            if (n != 0 && ScratchPoolCap() != 0) {
+              std::lock_guard<std::mutex> lk(ScratchPoolMutex());
+              if (ScratchPoolBytes() + n <= ScratchPoolCap()) {
+                ScratchPool()[n].push_back(p);
+                ScratchPoolBytes() += n;
+                return;
+              }
+            }
+            cudaFree(p);
+          });
     } catch (...) {
       // CPU managers throw here; they do not use device scratch at all.
     }
