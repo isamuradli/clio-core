@@ -230,6 +230,11 @@ class Cusz : public Compressor {
         if (cudaMalloc(&d_out, n * sizeof(float)) != cudaSuccess) break;
         free_out = true;
       }
+      // KCU_x_lorenzo_1d reads this buffer before writing it (~8000 uninit
+      // reads, per initcheck); zeroed pages hid it until nvcomp dirtied them.
+      if (cudaMemsetAsync(d_out, 0, n * sizeof(float), stream) != cudaSuccess) {
+        break;
+      }
 
       // The compressed stream must be device-resident for cuSZ.
       uint8_t *d_stream = nullptr;
