@@ -15,6 +15,8 @@
 #include <clio_ctp/compress/preprocess/byte_shuffle.h>
 #include <clio_ctp/compress/preprocess/quality_metrics_gpu.h>
 #include <clio_ctp/compress/preprocess/quantization.h>
+// For CLIO_IPC's device block pool -- see MeasureStoredChunkQuality.
+#include <clio_runtime/ipc_manager.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -69,15 +71,35 @@ bool MeasureStoredChunkQuality(
   // diagnostic path where synchronizing with everything is acceptable.
   cudaStream_t stream = nullptr;
 
+  // Through the runtime's device block pool rather than cudaMalloc directly.
+  // This runs on EVERY write (it is the one site all four modes pass through),
+  // so its three buffers are three of the seventeen allocations a chunk makes,
+  // and their sizes repeat exactly from chunk to chunk -- which is what the
+  // pool is for. cudaMalloc and cudaFree both synchronize; the pool's hit path
+  // does neither.
   void *d_a = nullptr, *d_b = nullptr, *d_q = nullptr;
+  ctp::ipc::AllocatorId a_id, b_id, q_id;
+  auto acquire = [&](void **dst, ctp::ipc::AllocatorId *id, size_t bytes) {
+    char *base = nullptr;
+    *id = CLIO_IPC->AllocateAndRegisterGpuBackend(
+        /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, bytes,
+        &base);
+    if (id->IsNull() || base == nullptr) return false;
+    *dst = base;
+    return true;
+  };
+  auto release = [&](void *p, ctp::ipc::AllocatorId *id) {
+    if (p && !id->IsNull()) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, *id);
+    *id = ctp::ipc::AllocatorId();
+  };
   auto cleanup = [&] {
-    if (d_a) cudaFree(d_a);
-    if (d_b) cudaFree(d_b);
-    if (d_q) cudaFree(d_q);
+    release(d_a, &a_id);
+    release(d_b, &b_id);
+    release(d_q, &q_id);
   };
 
   // 1. Codec inverse, into a buffer the size the codec was FED.
-  if (cudaMalloc(&d_a, post_transform_size) != cudaSuccess) return false;
+  if (!acquire(&d_a, &a_id, post_transform_size)) return false;
   if (!ctp::NvComp::DecompressInto(compressed, post_transform_size, d_a,
                                    stream)) {
     cleanup();
@@ -87,7 +109,7 @@ bool MeasureStoredChunkQuality(
 
   // 2. Byte-shuffle inverse. `shuffle` is the WIDTH, not a flag.
   if (shuffle > 0) {
-    if (cudaMalloc(&d_b, post_transform_size) != cudaSuccess) {
+    if (!acquire(&d_b, &b_id, post_transform_size)) {
       cleanup();
       return false;
     }
@@ -101,7 +123,7 @@ bool MeasureStoredChunkQuality(
   // 3. Quantizer inverse -- the step that returns the data to float32 in the
   //    original domain, and the only one that can carry real error.
   if (quant != nullptr) {
-    if (cudaMalloc(&d_q, orig_bytes) != cudaSuccess) { cleanup(); return false; }
+    if (!acquire(&d_q, &q_id, orig_bytes)) { cleanup(); return false; }
     if (!pp::DequantizeDevice(cur, orig_bytes / sizeof(float), *quant, d_q)) {
       cleanup();
       return false;
