@@ -46,6 +46,12 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#if CTP_IS_HOST
+// For the reader/writer lock over client_backends; host-only, like the map
+// itself -- the device pass sees neither.
+#include <mutex>
+#include <shared_mutex>
+#endif
 
 namespace clio::run {
 namespace gpu {
@@ -196,6 +202,32 @@ class IpcManager {
   std::vector<PerGpuDeviceState> per_gpu_devices_;
 
   /**
+   * Guards per_gpu_devices_ and every client_backends map inside it.
+   *
+   * client_backends is mutated by RegisterClientBackend (insert) and
+   * UnregisterClientBackend (erase) from every worker thread that allocates or
+   * frees a GPU backend, and read concurrently by FindClientBackend on the
+   * ToFullPtr path. It carried no lock at all, which is a data race on a
+   * std::unordered_map: concurrent insert and erase rehash and free the same
+   * bucket array and nodes, and the damage lands in the host allocator's own
+   * metadata. Observed as `malloc_consolidate(): unaligned fastbin chunk` and
+   * an abort, on roughly one vpic/smoke run in seven.
+   *
+   * It was rare before only by accident. cudaMalloc and cudaFree bracketed
+   * every register/unregister pair, and both serialize on the CUDA context, so
+   * the mutations were spaced far enough apart that the window was almost never
+   * hit. Pooling those allocations removes that accidental spacing -- which is
+   * how the race surfaced, not what caused it.
+   *
+   * Shared rather than exclusive because lookups vastly outnumber mutations:
+   * ToFullPtr consults this for every GPU-backed pointer resolution, while a
+   * chunk registers and unregisters seventeen backends.
+   *
+   * `mutable` so the const lookup can take a reader lock.
+   */
+  mutable std::shared_mutex client_backends_mutex_;
+
+  /**
    * Initialize per-device gpu2cpu queues. Implemented in
    * src/gpu/gpu2cpu_init_hip.cc (CUDA/ROCm) or
    * src/gpu/gpu2cpu_init_sycl.cc (SYCL).
@@ -238,21 +270,32 @@ class IpcManager {
       u32 gpu_id, const ctp::ipc::AllocatorId &alloc_id);
 
   /**
-   * Resolve an AllocatorId to its registered ClientBackend record.
-   * Used by IpcManager::ToFullPtr when a CPU SHM allocator lookup
-   * misses, so this must be inline (header-only) — callers like
-   * clio_commands link without libclio_run_cxx_gpu.
-   * Returns nullptr if unknown.
+   * Resolve an AllocatorId to its registered ClientBackend record, COPYING it
+   * into *out. Returns false if unknown.
+   *
+   * Used by IpcManager::ToFullPtr when a CPU SHM allocator lookup misses, so
+   * this must be inline (header-only) — callers like clio_commands link
+   * without libclio_run_cxx_gpu.
+   *
+   * This returned `const ClientBackend *` — a pointer straight into the map —
+   * which no lock can make safe: the reader holds it after the lock is
+   * dropped, and the next UnregisterClientBackend erases the node out from
+   * under it. Handing back a copy is what lets the lock end at the return
+   * statement. The record is six scalars, so the copy costs nothing worth
+   * measuring against the map lookup it replaces.
    */
-  inline const ClientBackend *FindClientBackend(
-      u32 gpu_id, const ctp::ipc::AllocatorId &alloc_id) const {
-    if (gpu_id >= per_gpu_devices_.size()) return nullptr;
+  inline bool FindClientBackend(u32 gpu_id,
+                                const ctp::ipc::AllocatorId &alloc_id,
+                                ClientBackend *out) const {
+    std::shared_lock<std::shared_mutex> lk(client_backends_mutex_);
+    if (gpu_id >= per_gpu_devices_.size()) return false;
     u64 key = (static_cast<u64>(alloc_id.major_) << 32) |
               static_cast<u64>(alloc_id.minor_);
     const auto &dev = per_gpu_devices_[gpu_id];
     auto it = dev.client_backends.find(key);
-    if (it == dev.client_backends.end()) return nullptr;
-    return &it->second;
+    if (it == dev.client_backends.end()) return false;
+    if (out) *out = it->second;
+    return true;
   }
 
 #endif  // CTP_IS_HOST

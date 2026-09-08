@@ -124,6 +124,9 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
 }
 
 void gpu::IpcManager::FinalizeGpuQueues() {
+  // Exclusive: this clears every client_backends map AND the vector holding
+  // them, so no lookup may be in flight.
+  std::unique_lock<std::shared_mutex> lk(client_backends_mutex_);
   for (auto &dev : per_gpu_devices_) {
     if (dev.queue_backend) {
       ctp::GpuApi::FreeHost(dev.queue_backend);
@@ -136,6 +139,9 @@ void gpu::IpcManager::FinalizeGpuQueues() {
 }
 
 bool gpu::IpcManager::RegisterClientBackend(const ClientBackend &b) {
+  // Exclusive: this inserts into client_backends, which FindClientBackend
+  // reads concurrently. See client_backends_mutex_.
+  std::unique_lock<std::shared_mutex> lk(client_backends_mutex_);
   if (b.gpu_id >= per_gpu_devices_.size()) return false;
   u64 key = (static_cast<u64>(b.alloc_id.major_) << 32) |
             static_cast<u64>(b.alloc_id.minor_);
@@ -146,6 +152,8 @@ bool gpu::IpcManager::RegisterClientBackend(const ClientBackend &b) {
 
 void gpu::IpcManager::UnregisterClientBackend(
     u32 gpu_id, const ctp::ipc::AllocatorId &alloc_id) {
+  // Exclusive: erase frees the node a concurrent reader would be walking.
+  std::unique_lock<std::shared_mutex> lk(client_backends_mutex_);
   if (gpu_id >= per_gpu_devices_.size()) return;
   u64 key = (static_cast<u64>(alloc_id.major_) << 32) |
             static_cast<u64>(alloc_id.minor_);

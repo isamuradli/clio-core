@@ -1287,11 +1287,11 @@ clio::run::TaskResume Runtime::DeregisterMemory(
     // allocation once this has happened -- freeing under a live import is a
     // cross-process use-after-free, which is exactly why FreeGpuBackend used
     // to skip remotely-registered backends and leak them instead.
-    if (const auto *backend =
-            gpu_ipc->FindClientBackend(task->gpu_id_, alloc_id)) {
-      if (backend->kind == clio::run::gpu::IpcManager::MemKind::kDeviceMem &&
-          backend->device_ptr != nullptr) {
-        ctp::GpuApi::CloseIpcMemHandle(backend->device_ptr);
+    clio::run::gpu::IpcManager::ClientBackend backend;
+    if (gpu_ipc->FindClientBackend(task->gpu_id_, alloc_id, &backend)) {
+      if (backend.kind == clio::run::gpu::IpcManager::MemKind::kDeviceMem &&
+          backend.device_ptr != nullptr) {
+        ctp::GpuApi::CloseIpcMemHandle(backend.device_ptr);
       }
     }
     gpu_ipc->UnregisterClientBackend(task->gpu_id_, alloc_id);
