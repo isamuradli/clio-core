@@ -59,9 +59,18 @@ __device__ static void AtomicMinF(float *addr, float val) {
  */
 __global__ void QualityKernel(const float *__restrict__ d_orig,
                               const float *__restrict__ d_decoded, int n,
-                              float shift, float *__restrict__ out) {
+                              float *__restrict__ out) {
   __shared__ float s[9][kThreads];
   const int t = threadIdx.x;
+  // The shift is d_orig[0], and it used to be READ BACK TO THE HOST -- a
+  // four-byte device-to-host copy followed by a full cudaStreamSynchronize --
+  // purely so it could be handed straight back as this kernel argument. The
+  // kernel already has d_orig, so it reads element 0 itself: one broadcast
+  // load out of L2 against a pipeline stall per call. Slot 9 carries the same
+  // value home inside the readback the results already make, because
+  // QualityFromAccumulators needs it host-side too.
+  const float shift = (n > 0) ? d_orig[0] : 0.f;
+  if (blockIdx.x == 0 && t == 0) out[9] = shift;
   // Slots 2 and 3 seed to +/-FLT_MAX so a min/max over an empty stride is
   // neutral; the other seven seed to zero.
   float v[9] = {0.f, 0.f, 3.4e38f, -3.4e38f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -119,28 +128,24 @@ bool ComputeQualityDevice(const void *d_orig, const void *d_decoded,
 
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   float *d_acc = nullptr;
-  if (cudaMalloc(&d_acc, 9 * sizeof(float)) != cudaSuccess) return false;
+  // Ten floats, not nine: slot 9 is the shift, which the kernel publishes so
+  // it can come home with the results instead of on a stalled copy of its own.
+  if (cudaMalloc(&d_acc, 10 * sizeof(float)) != cudaSuccess) return false;
 
-  // The shift is the first original element: one 4-byte read, and any value
-  // inside the data conditions the subtraction equally well.
-  float shift = 0.f;
-  bool ok = cudaMemcpyAsync(&shift, d_orig, sizeof(float),
-                            cudaMemcpyDeviceToHost, s) == cudaSuccess &&
-            cudaStreamSynchronize(s) == cudaSuccess;
-
-  const float init[9] = {0.f, 0.f, 3.4e38f, -3.4e38f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  ok = ok && cudaMemcpyAsync(d_acc, init, sizeof(init), cudaMemcpyHostToDevice,
-                             s) == cudaSuccess;
+  const float init[10] = {0.f, 0.f, 3.4e38f, -3.4e38f,
+                          0.f, 0.f, 0.f,     0.f,      0.f, 0.f};
+  bool ok = cudaMemcpyAsync(d_acc, init, sizeof(init), cudaMemcpyHostToDevice,
+                            s) == cudaSuccess;
   if (ok) {
     const int ni = static_cast<int>(n);
     int blocks = (ni + kThreads - 1) / kThreads;
     if (blocks > kMaxBlocks) blocks = kMaxBlocks;
     QualityKernel<<<blocks, kThreads, 0, s>>>(
         static_cast<const float *>(d_orig),
-        static_cast<const float *>(d_decoded), ni, shift, d_acc);
+        static_cast<const float *>(d_decoded), ni, d_acc);
     ok = cudaGetLastError() == cudaSuccess;
   }
-  float h[9] = {0};
+  float h[10] = {0};
   if (ok) {
     ok = cudaMemcpyAsync(h, d_acc, sizeof(h), cudaMemcpyDeviceToHost, s) ==
          cudaSuccess;
@@ -159,7 +164,7 @@ bool ComputeQualityDevice(const void *d_orig, const void *d_decoded,
   a.sum_y = h[6];
   a.sum_yy = h[7];
   a.sum_xy = h[8];
-  a.shift = shift;
+  a.shift = h[9];
   *out = QualityFromAccumulators(a, n);
   return true;
 }
