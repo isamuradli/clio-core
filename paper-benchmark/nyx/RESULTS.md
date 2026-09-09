@@ -9,7 +9,7 @@ states. Where a section predates the current defaults it says so.
 
 ### Seeing what a lossy bound costs
 
-`../viz_lossy.py` puts the original, the decompressed copy and `|error|` on one
+`../plot/viz_lossy.py` puts the original, the decompressed copy and `|error|` on one
 plate. It needs the decompressed bytes, which the replay driver will write on a
 cold read:
 
@@ -24,7 +24,7 @@ for spec in 0.001:eb001 0.01:eb01 0.1:eb10; do
       --dump-decompressed /tmp/nyx-decomp/$T --tag nyx_$T \
       --dir /tmp/nyx-quick --ext .f32 --chunk 1048576 --check-bound
 done
-../viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
+../plot/viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
     --plt /tmp/nyx-quick-plotfiles --compare 0.001:/tmp/nyx-decomp/eb001 \
     --compare 0.01:/tmp/nyx-decomp/eb01 --compare 0.1:/tmp/nyx-decomp/eb10
 ../plot/viz_selection.py actions --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
@@ -276,7 +276,7 @@ codec, and the search is bounded by what the action space can express.
 
 Ranking behind `README.md`'s "Default Evolving Benchmark Configuration". Six configurations, 101 dumps
 each, 4,800 block samples per configuration, 1 MiB blocks, sampled every 10
-timesteps. Raw per-block values in `../evolution-study/nyx/`.
+timesteps. The raw per-block values were cleared from `evolution-study/` ahead of a new campaign; recoverable with `git show 256e7c2c`.
 
 Average normalized block evolution: **0.1159**, with **76.7% of blocks active**
 and **80.04% of cells bit-identical** to the previous dump (99.97% on the first

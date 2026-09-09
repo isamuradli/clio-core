@@ -157,7 +157,7 @@ go to a scratch directory and are deleted when the render finishes.
 ./visualize.sh --keep-dumps          # keep the staged bytes too
 ```
 
-It computes `--chunk` from `--box` rather than taking it, because `viz_atoms.py`
+It computes `--chunk` from `--box` rather than taking it, because `../plot/viz_atoms.py`
 assumes one chunk per field per frame and anything else produces fragments that
 will not reshape.
 
@@ -169,10 +169,10 @@ which are exactly what NeuroPress compressed.
 ```bash
 ./run_config.sh dynamic --box 20 --steps 500 --gap 20 --chunk 768000 \
     --require-device --raw /tmp/lmp-raw --results /tmp/lmp-lossless --tag ll
-./viz_atoms.py --raw /tmp/lmp-raw --out /tmp/lmp-viz          # ~20 s
+../plot/viz_atoms.py --raw /tmp/lmp-raw --out /tmp/lmp-viz          # ~20 s
 ```
 
-`viz_atoms.py` draws a 1.2σ slab through the middle of the box, coloured by
+`../plot/viz_atoms.py` draws a 1.2σ slab through the middle of the box, coloured by
 speed, as a montage and a GIF — a slab and not the whole box, because 32,000
 atoms projected through 33σ of depth is a uniform smear at every timestep and
 the melt is invisible. `evolution.png` carries MSD, g(r), temperature, the

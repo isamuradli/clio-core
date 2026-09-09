@@ -133,7 +133,7 @@ chunks the gate did select were the ones that mattered.
 
 Ranking behind `README.md`'s "Default Evolving Benchmark Configuration". Nine configurations, 101 dumps
 each, 8,000 block samples per configuration, 1 MiB blocks, sampled every 10
-timesteps. Raw per-block values in `../evolution-study/warpx/`.
+timesteps. The raw per-block values were cleared from `evolution-study/` ahead of a new campaign; recoverable with `git show 256e7c2c`.
 
 Average normalized block evolution: **0.1636**, with **88.4% of blocks active**
 and **21.99% of cells bit-identical** to the previous dump (94.14% on the first

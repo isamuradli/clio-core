@@ -79,13 +79,13 @@ VOL, so `warpx/run_config.sh` always runs the simulation.
 
 | script | what it does |
 |---|---|
-| `figure_evolution.py` | one field at the first, middle and last frame, **one shared colour scale** across the three so a panel that looks empty *is* empty |
-| `figure_lossy.py` | the same three frames, original against decompressed, plus the error map |
-| `viz_fields.py` | a full montage and GIF of an f32 dump sequence, with blast-wave diagnostics |
+| `plot/figure_evolution.py` | one field at the first, middle and last frame, **one shared colour scale** across the three so a panel that looks empty *is* empty |
+| `plot/figure_lossy.py` | the same three frames, original against decompressed, plus the error map |
+| `plot/viz_fields.py` | a full montage and GIF of an f32 dump sequence, with blast-wave diagnostics |
 | `plot/viz_selection.py {actions,bound,chunks}` | a run chunk by chunk: what the model saw, what it picked, and whether the error bound did anything |
-| `warpx/viz_openpmd.py`, `lammps/viz_atoms.py` | the same for WarpX's openPMD fields and LAMMPS's atom state |
+| `plot/viz_openpmd.py`, `plot/viz_atoms.py` | the same for WarpX's openPMD fields and LAMMPS's atom state |
 
-`figure_evolution.py` refuses to write a blank plate: a slice that is
+`plot/figure_evolution.py` refuses to write a blank plate: a slice that is
 identically zero while the volume is not means the plane or the shape is wrong,
 not that the data is static. Pass `--shape` for a non-cubic grid — WarpX's
 64×64×512 has exactly 128³ cells, so the cube-root test *passes* and silently
@@ -158,13 +158,17 @@ Three things that bite on a single local GPU:
 
 ## Where the paper's figures come from
 
-The evaluation's heterogeneity section rests on three figures, all of them
-backed by data in [`evolution-study/`](evolution-study/README.md) rather than by
-anything regenerated at paper time. The dumps behind that study are **not
-kept** — about 171 GB across the four sweeps, deleted by each `run*.sh` after
-measuring — so these measurement files are the record.
+The evaluation's heterogeneity section rests on three figures, each computed
+from one measurement file rather than regenerated at paper time. Those files
+have been **cleared from `evolution-study/`** ahead of a new campaign; restore
+them with `git checkout 6ce4226f~1 -- paper-benchmark/evolution-study/`. The
+simulation dumps behind them were never kept at all — about 171 GB across the
+four sweeps, deleted by each `run*.sh` after measuring.
 
-| figure | source file | how to reproduce the numbers |
+The table is the record of what the *published* figures were computed from, so
+a regenerated figure can be checked against the numbers the old one reported.
+
+| figure | source file (in history, not the tree) | the numbers it produced |
 |---|---|---|
 | **Fig. 3** — activity is spatially localized | `evolution-study/nyx/e10_cfl08.blocks.csv.gz` | group `pct_cells_same` by block index, density field, last frame pair → outermost 85.3%, central 26.4% |
 | **Fig. 4** — compression varies within one dump | `evolution-study/nyx-20gb/insitu.blobs.csv.gz` | 233× spread at step 1559; median within-dump spread 61× over 300 dumps; 216 of 300 dumps assigned more than one codec |

@@ -38,7 +38,7 @@ the render finishes.
 ```
 
 `--steps` is the only knob that makes a run shorter here; the grid cannot be
-shrunk, for the reason below. `viz_openpmd.py` writes no GIFs, unlike the other
+shrunk, for the reason below. `../plot/viz_openpmd.py` writes no GIFs, unlike the other
 three viewers.
 
 Nothing needs dumping: WarpX writes openPMD-HDF5 as it always does and the VOL
@@ -48,10 +48,10 @@ compresses on the way past, so the native `.h5` files are in
 ```bash
 ./run_config.sh dynamic --ncell "64 64 512" --steps 40 --interval 4 \
     --stage-h2d --results /tmp/wx2 --tag ll                  # ~15 s
-./viz_openpmd.py --run /tmp/wx2/ll --out /tmp/wx-viz
+../plot/viz_openpmd.py --run /tmp/wx2/ll --out /tmp/wx-viz
 ```
 
-`viz_openpmd.py` needs **no h5py** — datasets come out through the `h5dump` CLI
+`../plot/viz_openpmd.py` needs **no h5py** — datasets come out through the `h5dump` CLI
 (`-b LE -o file`), which ships with HDF5 and is therefore already present
 anywhere WarpX built against it. It draws x–z slices at mid-y with z upward:
 the laser enters at the bottom and the wake oscillations behind it are resolved
@@ -182,7 +182,7 @@ standing wave, not laser-wakefield acceleration. Its evolution *rises* through
 the run, which is the tell. The run exits 0 and holds no NaN, so
 `evolution_rank.py` cannot reject it automatically; the reason is recorded in
 its `evolution.json` under `disqualified` and honoured by the ranking, with the
-raw diagnostic in `../evolution-study/warpx/FE_nomovingwindow.txt`.
+raw diagnostic in `FE_nomovingwindow.txt`, cleared from `evolution-study/` ahead of a new campaign; recoverable with `git show 256e7c2c`.
 
 **About a tenth of `E`/`B` blocks and an eighth of `j`/`rho` blocks never change
 in any configuration** — the vacuum region ahead of the pulse, where the fields

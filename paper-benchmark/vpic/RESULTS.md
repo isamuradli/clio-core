@@ -209,8 +209,8 @@ which says the achievable ceiling is not in doubt; only the prediction is.
 
 Ranking behind `README.md`'s "Default Evolving Benchmark Configuration".
 Four configurations, 100 dumps each, 12,672 block samples per configuration,
-1 MiB blocks, sampled every 10 timesteps. Raw per-block values in
-`../evolution-study/vpic/`.
+1 MiB blocks, sampled every 10 timesteps. The raw per-block values were
+cleared from `evolution-study/` ahead of a new campaign; recoverable with `git show 256e7c2c`.
 
 Average normalized block evolution: **0.6355**, with **93.8% of blocks active**
 and only **8.33% of cells bit-identical** to the previous dump.

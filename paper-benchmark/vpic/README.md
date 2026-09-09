@@ -161,7 +161,7 @@ VPIC dumps the same shape Nyx does, so the shared viewers read both:
 ```bash
 ./gen_fields.sh --ncell 32 --nppc 8 --steps 1000 --dump-int 40 \
     --clean-div 5 --out /tmp/vpic-quick                    # ~4 s
-../viz_fields.py --fields /tmp/vpic-quick --out /tmp/vpic-viz --field cby --field ex
+../plot/viz_fields.py --fields /tmp/vpic-quick --out /tmp/vpic-viz --field cby --field ex
 ```
 
 `--clean-div` is new and matters for anything you intend to *look* at: at 0 the
@@ -171,7 +171,7 @@ noise phase — measured on `cby`, amplitude grows from ±0.045 to ±0.169 and
 0 of 24 consecutive dumps are bit-identical. (`rhob` stays constant at any
 setting; this deck accumulates no bound charge.)
 
-`viz_fields.py` turns its two blast-wave panels off automatically here — shock
+`plot/viz_fields.py` turns its two blast-wave panels off automatically here — shock
 radius and "% off ambient" are defined against a quiet background, and a Weibel
 run has none. It substitutes an amplitude panel.
 

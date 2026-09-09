@@ -187,18 +187,18 @@ The pieces, if you want them separately:
 ```bash
 ./gen_fields.sh --ncell 64 --steps 400 --plot-int 16 --exp-energy 10 \
                 --keep-plt --out /tmp/nyx-quick             # ~2 s, 157 MiB
-../viz_fields.py --fields /tmp/nyx-quick --plt /tmp/nyx-quick-plotfiles \
+../plot/viz_fields.py --fields /tmp/nyx-quick --plt /tmp/nyx-quick-plotfiles \
                 --out /tmp/nyx-viz                          # ~4 s
 ```
 
-`../viz_fields.py` reads the flat `.f32` dumps with nothing but numpy, and that is
+`../plot/viz_fields.py` reads the flat `.f32` dumps with nothing but numpy, and that is
 the point: those files, not Nyx's plotfiles, are what the compressor is handed,
 so what it draws is what the sweep compresses. Per field it writes a montage of
 mid-plane slices across the run and the same slices as a GIF; once per run it
 writes `evolution.png`, which puts shock radius, fraction of the domain off
 ambient, and a zlib stand-in for the compression ratio on one time axis.
 
-**Does this run actually evolve?** Point `viz_fields.py` at a dataset and the
+**Does this run actually evolve?** Point `plot/viz_fields.py` at a dataset and the
 answer is visible rather than inferred — the `evolution.png` panel carries shock
 radius, the fraction of the domain off ambient, and the share of cells
 bit-identical to the previous dump. At the deck's `exp_energy=1` and a short
@@ -235,7 +235,7 @@ inside it, because `run_config.sh` sizes the payload with `du -sb $FIELDS` and
 counts frames with `ls $FIELDS | grep -c ^plt`, and "plotfiles" would corrupt
 both.
 
-Even with `--keep-plt`, `../viz_fields.py` opens the plotfiles only to read
+Even with `--keep-plt`, `../plot/viz_fields.py` opens the plotfiles only to read
 `Header` for the simulation time, so frames are labelled `t=0.0236` rather than
 `dump 25`. Without `--plt` it falls back to dump indices and everything else
 still works. (yt is not installed here and there is no `pip`, so the documented

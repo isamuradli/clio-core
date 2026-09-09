@@ -230,7 +230,7 @@ which is why an absolute difference could not do this job here.
 Three sources, because the four workloads deliver data three different ways:
 `f32` reads the `plt%05d/fab0000_comp%02d_<field>.f32` dumps Nyx and VPIC share,
 `openpmd` reads WarpX's `.h5` through the `h5dump` CLI (no h5py on this machine,
-same reason `viz_openpmd.py` gives), and `raw` reads the blob bytes LAMMPS's
+same reason `plot/viz_openpmd.py` gives), and `raw` reads the blob bytes LAMMPS's
 driver writes under `--raw`, which is the only way to see an in-process workload
 at all.
 
@@ -722,8 +722,8 @@ sampled **every 10**, and scored with `evolution.py` (section 1). Twenty-six
 configurations in total: WarpX 9, LAMMPS 7, Nyx 6, VPIC 4. The winner of each is
 now that workload's default, documented with its parameters and official
 references under "Default Evolving Benchmark Configuration" in the workload's
-own README; each workload's ranking table is in its `RESULTS.md`, and the raw
-per-block measurements, summaries and sweep scripts are in `evolution-study/`.
+own README; each workload's ranking table is in its `RESULTS.md`. The raw
+per-block measurements, summaries and sweep scripts were cleared from `evolution-study/` ahead of a new campaign; recoverable with `git show 256e7c2c`.
 
 | workload | default chosen | mean E | active blocks | cells bit-identical | what actually moved it |
 |---|---|---|---|---|---|

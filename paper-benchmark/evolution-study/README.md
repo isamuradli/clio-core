@@ -1,41 +1,60 @@
-# The 1,000-timestep evolution study — raw record
+# The 1,000-timestep evolution study
 
-The measurements behind each workload's "Default Evolving Benchmark
-Configuration" section. **26 configurations**, every one run for 1,000
-timesteps and sampled every 10, scored by `../evolution.py`.
+**This directory is empty pending a new campaign.** Its contents — 26
+configurations' worth of summaries, per-block CSVs and sweep scripts — were
+cleared in `6ce4226f` because the runs behind them are being replaced at larger
+scale, and a stale measurement beside a new figure is worse than none.
 
-```
-<workload>/<config>.json            evolution.py's summary: mean/median/max/min,
-                                    pct_active, pct_cells_same, and the full
-                                    per-interval series for both metrics
-<workload>/<config>.blocks.csv.gz   the RAW per-block values -- one row per
-                                    (step_from, step_to, field, block) with its
-                                    evolution and pct_cells_same
-<workload>/run*.sh                  the exact sweep that produced them
-warpx/FE_*.txt                      WarpX FieldEnergy, the evidence that
-                                    do_moving_window=0 is a resonant cavity
-```
-
-`nyx-20gb/` is a **separate record, not one of the 26**: how to make Nyx
-produce ~20 GB over its timesteps without leaving the regime the study
-selected, measured with the same tool so it compares directly. It carries the
-in-situ run's `selection`/`explore`/`blobs` CSVs as well, which no study
-configuration does.
-
-Re-rank any workload without re-running anything:
+Everything is in history:
 
 ```bash
-mkdir -p /tmp/ev && for f in nyx/*.json; do
-    d=/tmp/ev/$(basename $f .json); mkdir -p $d; cp $f $d/evolution.json; done
-../evolution_rank.py /tmp/ev
+git show 256e7c2c --stat                                   # the commit that added it
+git checkout 6ce4226f~1 -- paper-benchmark/evolution-study/ # all 78 files back
 ```
 
-`blocks.csv` is the file to go to for anything the summary does not answer —
-per-field breakdowns, which blocks never moved, how a single field's activity
-tracks the run. Both per-field tables in `vpic/README.md` and `nyx/README.md`
-were computed from it, not from the summaries.
+## What it held, and what replaces it
 
-The dumps these were measured from are NOT kept: the four sweeps produced about
-120 GB of field data between them (12.8 GB per VPIC configuration alone) and
-each `run*.sh` deletes its own after measuring it. Re-run the script to
-regenerate.
+Each workload's default was selected by measuring how fast its data actually
+evolves — because a selector's whole job is to notice that data changed, and a
+simulation that reaches steady state early says nothing about whether it can.
+26 configurations across four workloads, every one run 1,000 timesteps and
+sampled every 10, scored by `../evolution.py` and ranked by
+`../evolution_rank.py`:
+
+```
+<workload>/<config>.json            mean/median/p10/last_quarter, pct_active,
+                                    pct_cells_same, and the per-interval series
+<workload>/<config>.blocks.csv.gz   one row per (step_from, step_to, field,
+                                    block) -- the only per-field breakdown
+<workload>/run*.sh                  the sweep that produced them
+warpx/FE_*.txt                      WarpX FieldEnergy, the evidence that
+                                    do_moving_window=0 is a resonant cavity
+nyx-20gb/                           a separate 20 GB record, and the only
+                                    in-situ selection/explore/blobs CSVs
+```
+
+The conclusions did **not** go with the data. Each workload's README keeps its
+"Default Evolving Benchmark Configuration" section — the parameters, the
+upstream reference for each, the values tested and the outcome numbers — and
+those sections are self-contained. What is gone is the raw evidence beneath
+them.
+
+The dumps were never here to begin with: about 171 GB across the four sweeps,
+deleted by each `run*.sh` after measuring. Re-running a sweep regenerates them.
+
+## Running the replacement
+
+`../README.md` carries the campaign parameters as local-GPU invocations, and
+records which file each of the paper's Figures 3-5 was computed from, so a
+regenerated figure can be checked against the numbers the published one
+reported.
+
+Two things to clear first:
+
+- **`h5dump` must be installed** (`hdf5-tools`). `../evolution.py --source
+  openpmd` and `../analysis/validate/warpx_gen_fields.sh` both shell out to it
+  and neither fails gracefully without it.
+- **Nyx in situ stores zero blobs and exits 0.** The binary lost its Clio hook
+  in a rebuild; `nyx/patches/` carries the raw-field-dump and single-precision
+  patches but not that one, which is why it did not survive. The replay route
+  is unaffected.

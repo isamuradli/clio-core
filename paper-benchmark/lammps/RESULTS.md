@@ -186,7 +186,7 @@ where the bound pushed the ranking onto an action that expanded instead.
 
 ### Temporal redundancy: zero per value, 22.6% per byte
 
-`viz_atoms.py` measures how much of a frame survives the next timestep. Per
+`../plot/viz_atoms.py` measures how much of a frame survives the next timestep. Per
 value the answer is **0.00%, at every frame, for every field** — not one of the
 96,000 doubles in a frame is unchanged, where the Nyx blast starts at 99.9% and
 ends at 57%. That number is saturated and on its own misleading. Per byte:
@@ -308,7 +308,7 @@ What holds at both sizes is the gap between inference and measurement.
 
 Ranking behind `README.md`'s "Default Evolving Benchmark Configuration". Seven configurations, 101 frames
 each, 1,800 block samples per configuration, 1 MiB blocks, sampled every 10
-timesteps. Raw per-block values in `../evolution-study/lammps/`.
+timesteps. The raw per-block values were cleared from `evolution-study/` ahead of a new campaign; recoverable with `git show 256e7c2c`.
 
 Average normalized block evolution: **0.4368**, with **100.0% of blocks active**
 and **0.00% of cells bit-identical** to the previous frame.
