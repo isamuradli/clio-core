@@ -97,7 +97,7 @@ PY
 # metric, one shared color scale across the three panels.
 figure () {
   local ev=$1; shift
-  "$HERE/figure_evolution.py" "$@" \
+  "$HERE/plot/figure_evolution.py" "$@" \
       --out "$ev/evolution_begin_middle_end.png" 2>&1 | sed 's/^/   /'
 }
 

@@ -24,7 +24,7 @@
 # across the whole z mid-plane by symmetry and the montage comes out blank while
 # the field is perfectly healthy. Measured at 128^3, frame 20: zmom reaches 4.24
 # globally and 0.048 on the z mid-plane, against xmom's 4.23 on that same plane.
-# Same trap as the Fortran-ordering one in ../viz_fields.py, same silence.
+# Same trap as the Fortran-ordering one in ../plot/viz_fields.py, same silence.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -57,7 +57,7 @@ echo "== generating $([ "$KEEP" = 1 ] && echo "$FIELDS" || echo "dumps (scratch,
     --keep-plt --out "$FIELDS" ${EXTRA[@]+"${EXTRA[@]}"}
 
 echo "== rendering $OUT"
-"$HERE/../viz_fields.py" --fields "$FIELDS" --out "$OUT" \
+"$HERE/../plot/viz_fields.py" --fields "$FIELDS" --out "$OUT" \
     ${FIELDS:+$([ -d "$FIELDS-plotfiles" ] && echo --plt "$FIELDS-plotfiles")} \
     --field density --field xmom --field ymom --field zmom \
     --field rho_E --field rho_e \

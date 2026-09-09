@@ -82,7 +82,7 @@ VOL, so `warpx/run_config.sh` always runs the simulation.
 | `figure_evolution.py` | one field at the first, middle and last frame, **one shared colour scale** across the three so a panel that looks empty *is* empty |
 | `figure_lossy.py` | the same three frames, original against decompressed, plus the error map |
 | `viz_fields.py` | a full montage and GIF of an f32 dump sequence, with blast-wave diagnostics |
-| `viz_chunks.py`, `viz_actions.py`, `viz_bound.py` | a run chunk by chunk: what the model saw, what it picked, and whether the error bound did anything |
+| `plot/viz_selection.py {actions,bound,chunks}` | a run chunk by chunk: what the model saw, what it picked, and whether the error bound did anything |
 | `warpx/viz_openpmd.py`, `lammps/viz_atoms.py` | the same for WarpX's openPMD fields and LAMMPS's atom state |
 
 `figure_evolution.py` refuses to write a blank plate: a slice that is
@@ -151,7 +151,7 @@ Three things that bite on a single local GPU:
   chunk up and runs the CUDA kernels on it; the in-situ route needs no such flag
   because AMReX hands over a device pointer directly.
 - **WarpX's metric needs `h5dump`** (`hdf5-tools`). `evolution.py --source
-  openpmd` and `analysis/smoke/warpx_gen_fields.sh` both shell out to it, and
+  openpmd` and `analysis/validate/warpx_gen_fields.sh` both shell out to it, and
   neither fails gracefully when it is absent.
 
 ---

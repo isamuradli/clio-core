@@ -70,7 +70,7 @@ for f in ex ey ez cbx cby cbz tcax tcay tcaz jfx jfy jfz rhof rhob \
 done
 
 echo "== rendering $OUT"
-"$HERE/../viz_fields.py" --fields "$FIELDS" --out "$OUT" \
+"$HERE/../plot/viz_fields.py" --fields "$FIELDS" --out "$OUT" \
     "${FIELD_ARGS[@]}" --evolve-field cby
 
 echo

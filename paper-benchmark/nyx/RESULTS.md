@@ -27,7 +27,7 @@ done
 ../viz_lossy.py --orig /tmp/nyx-quick --out /tmp/nyx-viz/lossy \
     --plt /tmp/nyx-quick-plotfiles --compare 0.001:/tmp/nyx-decomp/eb001 \
     --compare 0.01:/tmp/nyx-decomp/eb01 --compare 0.1:/tmp/nyx-decomp/eb10
-../viz_actions.py --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
+../plot/viz_selection.py actions --out /tmp/nyx-viz/actions --sel 0.001:/tmp/nyx-lossy/eb001 \
     --sel 0.01:/tmp/nyx-lossy/eb01 --sel 0.1:/tmp/nyx-lossy/eb10
 ```
 
@@ -65,7 +65,7 @@ landed inside its bound at both settings:
 
 **The ratio is not monotone in the bound.** `0.001` stores BETTER than `0.01`
 (6.470× against 6.198×) on identical input. The cause is visible in
-`viz_actions.py`: under the balanced cost model the two bounds pick different
+`viz_selection.py actions`: under the balanced cost model the two bounds pick different
 codecs for the same chunk — on density, `0.01` sits on `zstd` for the first
 four dumps and reaches a mean 471.7×, while `0.001` sits on `cascaded` at
 26.2×, and the ordering reverses again once both settle on `ans`. Selection,
@@ -102,7 +102,7 @@ only where the selector took the offer.
 
 ### The action progression
 
-`../viz_actions.py` draws what was selected per dump, and it draws the whole
+`../plot/viz_selection.py actions` draws what was selected per dump, and it draws the whole
 action rather than just the codec: lane is the library, colour is the bound, a
 filled marker means quantize was taken, a square means the 4-byte shuffle.
 

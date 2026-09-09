@@ -35,7 +35,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
 
 _here = os.path.dirname(os.path.abspath(__file__))
-_spec = iu.spec_from_file_location("ev", os.path.join(_here, "evolution.py"))
+_spec = iu.spec_from_file_location(
+    "ev", os.path.join(_here, os.pardir, "evolution.py"))
 ev = iu.module_from_spec(_spec); _spec.loader.exec_module(ev)
 
 # A field that actually shows the physics, per workload. Not the first

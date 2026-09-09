@@ -73,7 +73,7 @@ not variance.
 row: it is seeded to -1 and overwritten only inside upstream's
 `if (d_quantized && quant_result.isValid())`, so `actual_psnr > 0` is the only
 evidence the quantizer executed. Read it before reporting a lossy LAMMPS
-number. `../viz_bound.py` plots exactly this comparison:
+number. `../plot/viz_selection.py bound` plots exactly this comparison:
 
 | | chunks | quantize chosen | applied |
 |---|---|---|---|

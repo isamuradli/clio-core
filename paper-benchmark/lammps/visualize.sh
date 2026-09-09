@@ -70,7 +70,7 @@ echo "== running $NATOMS atoms, $STEPS steps, a frame every $GAP, chunk $CHUNK"
 grep -E "stored [0-9]+ blob" "$RAW/../run.log" | sed 's/^/   /' || true
 
 echo "== rendering $OUT"
-"$HERE/viz_atoms.py" --raw "$RAW" --out "$OUT"
+"$HERE/../plot/viz_atoms.py" --raw "$RAW" --out "$OUT"
 
 echo
 echo "   $(ls "$OUT"/*.png "$OUT"/*.gif 2>/dev/null | wc -l) files in $OUT"

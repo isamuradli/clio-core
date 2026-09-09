@@ -251,7 +251,7 @@ def summarise(cell):
             "model_codec": sp.get("lib_name", ""),
             "adopted_codec": s.get("lib_name", ""),
             # THE ACTION, NOT JUST THE CODEC. NeuroPress's action is the tuple
-            # (library, shuffle, quantize, preset) -- viz_actions.py draws all
+            # (library, shuffle, quantize, preset) -- viz_selection.py actions draws all
             # four for exactly this reason -- so a sweep that keeps the library
             # and changes the stride HAS overridden the model. Measured on
             # nyx/explore-balance: 36 chunks were stored by exploration but

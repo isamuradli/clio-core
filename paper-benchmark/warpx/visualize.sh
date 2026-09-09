@@ -54,7 +54,7 @@ echo "== running WarpX ${NCELL// /x}, $STEPS steps, diag every $INT"
     ${EXTRA[@]+"${EXTRA[@]}"} 2>&1 | sed 's/^/   /'
 
 echo "== rendering $OUT"
-"$HERE/viz_openpmd.py" --run "$STORE/viz" --out "$OUT"
+"$HERE/../plot/viz_openpmd.py" --run "$STORE/viz" --out "$OUT"
 
 echo
 echo "   $(ls "$OUT"/*.png "$OUT"/*.gif 2>/dev/null | wc -l) files in $OUT"
