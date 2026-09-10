@@ -32,6 +32,10 @@
 #   dynamic-ratio  same, with the two latency weights zeroed so the cost
 #                  collapses to bytes/(ratio*bw) -- a ratio-only objective.
 #   learn          dynamic + online SGD from each chunk's measured outcome.
+#   learn-ratio    learn, latency weights zeroed -- online SGD against a
+#                  ratio-only objective. The learning arm's second half:
+#                  `learn` trains on the balanced cost, this one on the
+#                  same measurements scored purely by bytes saved.
 #   explore        dynamic-ratio + exploration: the top-K alternatives are
 #                  actually compressed and the measured winner adopted.
 #   best           best mode: exhaustive, ratio-only ranking.
@@ -44,7 +48,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 case "${1:-}" in
-  -h|--help) sed -n '2,34p' "$0"; exit 0;;
+  -h|--help) sed -n '2,38p' "$0"; exit 0;;
 esac
 CONFIG=${1:-dynamic}; shift || true
 BOX=80 STEPS=300 GAP=50 CHUNK=4194304
@@ -141,7 +145,7 @@ while [ $# -gt 0 ]; do
     --explore-k) EXPLORE_K_OPT=$2; shift 2;;
     --explore-thresh) THRESH_OPT=$2; shift 2;;
     --require-device) REQUIRE_DEVICE=1; shift;;
-    -h|--help) sed -n '2,34p' "$0"; exit 0;;
+    -h|--help) sed -n '2,38p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -183,6 +187,7 @@ case "$CONFIG" in
   dynamic)        ;;
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
   learn)          NP_LEARN=true ;;
+  learn-ratio)    NP_LEARN=true; COST_ENV=("${RATIO_ONLY[@]}") ;;
   explore)        NP_LEARN=true; NP_EXPLORE=true; EXPLORE_K=31; THRESH=0
                   COST_ENV=("${RATIO_ONLY[@]}") ;;
   best)           BEST=true ;;
@@ -231,7 +236,7 @@ case "$CONFIG" in
       nvcomp-*)                  STATIC_LIB=$_spec ;;
       *)                         STATIC_LIB=nvcomp-$_spec ;;
     esac ;;
-  *) echo "unknown config: $CONFIG" >&2; sed -n '2,34p' "$0" >&2; exit 2;;
+  *) echo "unknown config: $CONFIG" >&2; sed -n '2,38p' "$0" >&2; exit 2;;
 esac
 export NP_LEARN NP_EXPLORE EXPLORE_K THRESH BEST STATIC_LIB STATIC_SHUF STATIC_QUANT
 

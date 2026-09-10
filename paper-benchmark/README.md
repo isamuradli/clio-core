@@ -83,56 +83,61 @@ VOL, so `warpx/run_config.sh` always runs the simulation.
 | `plot/figure_lossy.py` | the same three frames, original against decompressed, plus the error map |
 | `plot/viz_fields.py` | a full montage and GIF of an f32 dump sequence, with blast-wave diagnostics |
 | `plot/viz_selection.py {actions,bound,chunks}` | a run chunk by chunk: what the model saw, what it picked, and whether the error bound did anything |
+| `plot/viz_learning.py {trend,perchunk}` | whether online SGD moves the model: `trend` smooths the cost-model error and draws a learning-off control against it, `perchunk` marks every chunk that produced a gradient. Reads `selection.csv`, gzipped or not. |
+| `plot/paper_figures.py {fig3,fig4,fig5,fields}` | the paper's Figures 3–5 and the field montage beside them |
 | `plot/viz_openpmd.py`, `plot/viz_atoms.py` | the same for WarpX's openPMD fields and LAMMPS's atom state |
 
 `plot/figure_evolution.py` refuses to write a blank plate: a slice that is
 identically zero while the volume is not means the plane or the shape is wrong,
-not that the data is static. Pass `--shape` for a non-cubic grid — WarpX's
-64×64×512 has exactly 128³ cells, so the cube-root test *passes* and silently
-reshapes a slab into a cube.
+not that the data is static.
 
 ---
 
 ## Running the large workloads on one local GPU
 
-These are the campaign runs the evolution study's figures are regenerated from.
-They were previously driven by Slurm jobs on Delta; the parameters below are
-those jobs' own, with the cluster paths localised. **Note the 8 MiB chunk** —
-the campaign uses `--chunk 8388608`, not the 4 MiB default.
+These are the invocations that produced what is in `evolution-study/` and
+`learning-study/`. They were previously driven by Slurm jobs on Delta; the
+parameters below are those jobs' own, with the cluster paths localised.
+
+**The chunk size is per workload, and for WarpX it is a correctness condition,
+not a tuning knob.** openPMD emits each AMReX box as a separate partial write,
+so at 4 MiB no chunk ever completes and zero field bytes reach the tier — while
+the run succeeds and the native `.h5` is perfect. Measured: 0 field blobs at
+4 MiB, 400 at 1 MiB.
 
 ```bash
-# --- Nyx, 30 GB campaign cell -------------------------------------------
-./nyx/gen_fields.sh --ncell 128 --steps 6400 --plot-int 10 --out "$FIELDS"
-CLIO_NEUROPRESS_STAGE_H2D=1 ./nyx/run_config.sh explore-balance \
-    --fields "$FIELDS" --bw 5e6 --eb 0.05 \
-    --explore-k 31 --explore-thresh -1 --chunk 8388608 \
-    --results "$RESULTS" --tag nyx_lossy_balance
-
 # --- Nyx, K=31 exploration ----------------------------------------------
+# 256^3 at 2,000 steps, NOT 128^3: see the CFL note below.
+./nyx/gen_fields.sh --ncell 256 --steps 2000 --plot-int 40 --out "$FIELDS"
 CLIO_NEUROPRESS_STAGE_H2D=1 ./nyx/run_config.sh explore-balance \
-    --fields "$FIELDS" --bw 5e6 --eb 1e-3 \
-    --explore-k 31 --chunk 8388608 --results "$RESULTS" --tag nyx_k31
+    --fields "$FIELDS" --bw 5e6 --eb 1e-3 --explore-k 31 \
+    --chunk 4194304 --results "$RESULTS" --tag nyx_k31
 
-# --- VPIC, 30 GB campaign cell (in situ, GPU-resident) ------------------
-./vpic/run_config_insitu.sh explore-balance \
-    --ncell 126 --steps 6000 --int 25 \
-    --chunk 8388608 --bw 5e6 --eb 0.05 \
-    --explore-k 31 --explore-thresh -1 --results "$RESULTS" --tag vpic_lossy_balance
+# --- VPIC, K=31 exploration ---------------------------------------------
+CLIO_NEUROPRESS_STAGE_H2D=1 ./vpic/run_config.sh explore-balance \
+    --fields "$VPIC_FIELDS" --bw 5e6 --eb 1e-3 --explore-k 31 \
+    --chunk 4194304 --results "$RESULTS" --tag vpic_k31
 
-# --- VPIC at the default evolving configuration, 1,000 steps ------------
-# 200 steps is NOT enough: the run is still in the noise phase and the first
-# blob compresses 1.006x. At 1,000 the Weibel instability has grown -- `cby`
-# amplitude goes from +/-0.045 to +/-0.169, with 0 of 24 dumps bit-identical.
-./vpic/run_config_insitu.sh explore-balance \
-    --ncell 126 --steps 1000 --int 25 --chunk 8388608 \
-    --bw 5e6 --eb 1e-3 --explore-k 3 --results "$RESULTS" --tag vpic_evolving
-
-# --- LAMMPS -------------------------------------------------------------
+# --- LAMMPS, K=31 exploration (in situ) ---------------------------------
+# NO --f32 here: the campaign is float64, 1206 chunks. --f32 halves both.
 ./lammps/run_config.sh explore-balance \
-    --box "$BOX" --steps "$STEPS" --gap "$GAP" --f32 --require-device \
-    --chunk 8388608 --bw 5e6 --eb 1e-3 --explore-k 31 \
-    --results "$RESULTS" --tag lammps
+    --box 40 --steps 2000 --gap 10 --require-device \
+    --chunk 4194304 --bw 5e6 --eb 1e-3 --explore-k 31 \
+    --results "$RESULTS" --tag lammps_k31
+
+# --- WarpX, K=31 exploration (in situ, stock unpatched WarpX) -----------
+# --bin is NOT optional: the default build links system HDF5 1.10, which has
+# no VOL plugin API. WarpX then runs to completion, writes a perfect 25 GB of
+# native openPMD, and stages ZERO chunks.
+./warpx/run_config.sh explore-balance \
+    --bin ~/src/warpx/build-h5114/bin/warpx.3d.NOMPI.CUDA.SP.PSP.OPMD.EB.QED \
+    --steps 2000 --interval 10 --chunk 1048576 --stage-h2d \
+    --bw 5e6 --eb 1e-3 --explore-k 31 --results "$RESULTS" --tag warpx_k31
 ```
+
+The learning campaign is the same four lines with `explore-balance` replaced by
+`learn` / `learn-ratio` / `dynamic` / `dynamic-ratio` and the `--explore-k`
+dropped; `learning-study/drivers/` holds them as runnable scripts.
 
 `--require-device` on LAMMPS is a correctness flag, not a performance one:
 without it the driver gathers each chunk into host memory, where NeuroPress's
@@ -160,27 +165,59 @@ Three things that bite on a single local GPU:
 
 The evaluation's heterogeneity section rests on three figures, each computed
 from one measurement file rather than regenerated at paper time. Those files
-have been **cleared from `evolution-study/`** ahead of a new campaign; restore
-them with `git checkout 6ce4226f~1 -- paper-benchmark/evolution-study/`. The
-simulation dumps behind them were never kept at all — about 171 GB across the
-four sweeps, deleted by each `run*.sh` after measuring.
+are in [`evolution-study/`](evolution-study/README.md); the simulation dumps
+behind them are not, and never were — about 72 GB, deleted by each `run*.sh`
+after measuring.
 
-The table is the record of what the *published* figures were computed from, so
-a regenerated figure can be checked against the numbers the old one reported.
-
-| figure | source file (in history, not the tree) | the numbers it produced |
+| figure | source file | what it gives |
 |---|---|---|
-| **Fig. 3** — activity is spatially localized | `evolution-study/nyx/e10_cfl08.blocks.csv.gz` | group `pct_cells_same` by block index, density field, last frame pair → outermost 85.3%, central 26.4% |
-| **Fig. 4** — compression varies within one dump | `evolution-study/nyx-20gb/insitu.blobs.csv.gz` | 233× spread at step 1559; median within-dump spread 61× over 300 dumps; 216 of 300 dumps assigned more than one codec |
-| **Fig. 5** — the same measurement on four workloads | `evolution-study/{nyx/e10_cfl08, warpx/baseline, vpic/baseline, lammps/melt_hot_nb}.json` | the `interval_means` and `interval_pct_cells_same` series in each summary |
+| **Fig. 3** — activity is spatially localized | `evolution-study/nyx/nyx_128_1000.blocks.csv.gz` | group `pct_cells_same` by block index, density field, last frame pair → outermost 85.6%, central 26.7% |
+| **Fig. 4** — compression varies within one dump | `evolution-study/nyx/nyx_256_2000_k31_4m.blobs.csv.gz` | 1102× maximum within-dump ratio spread, 484× median over 51 dumps; all 51 assigned more than one codec |
+| **Fig. 5** — the same measurement on four workloads | `evolution-study/{nyx/nyx_128_1000, vpic/vpic_126_2000, lammps/lammps_2000, warpx/warpx_2000}.json` | the `interval_means` and `interval_pct_cells_same` series in each |
 
-Note that Fig. 5 uses each workload's **`baseline`** configuration for VPIC and
-WarpX, not the default the evolution study selected. For VPIC the difference is
-load-bearing: `baseline` runs `clean_div_e_interval = 0`, under which
-`div_e_err`, `div_b_err`, `rhob` and `rhof` are never recomputed and are dumped
-unchanged every frame — a quarter of the payload. Its flat 26.9% cell-level
-redundancy is partly those four variables. Under the study's own default
-(`clean_div = 10`) the same measurement gives 8.33%.
+Fig. 5's four summaries, as the figure plots them:
+
+| workload | pairs | `pct_active` | cells bit-identical, first → last |
+|---|---|---|---|
+| Nyx | 100 | 76.5% | 100.0% → 50.1% |
+| VPIC | 199 | 93.8% | 8.2% → 8.3% |
+| LAMMPS | 200 | 100.0% | 0.0% → 0.0% |
+| WarpX | 200 | 93.6% | 94.1% → 10.5% |
+
+The published WarpX figure reported 94.2% → 11.0%, so this campaign reproduces
+it. LAMMPS at a flat 0.0% is not a bug: atom coordinates are continuous floats
+that move every step, so no cell is ever bit-identical, and LAMMPS has no Fig. 3
+for the same reason — there is no grid to localize activity on.
+
+The rendered figures are in each workload's own `<workload>/viz/`:
+
+```
+fig3.png  fig4.png  fig5.png            the three above
+fields_fig.png                          one field at begin / middle / end
+evolution_begin_middle_end.png          the same on one shared colour scale
+```
+
+`plot/paper_figures.py {fig3,fig4,fig5,fields}` draws them. Pass
+`--slices <run>.slices.npz` to read the cached mid-planes instead of the
+deleted dumps — 100–300 KB standing in for 4.8–26 GB, and byte-identical
+output. Pass `--shape NX,NY,NZ` for a non-cubic grid: WarpX's 64×64×512 has
+exactly 128³ cells, so the cube-root test *passes* and silently reshapes a slab
+into a cube.
+
+---
+
+## Does the *model* adapt? — `learning-study/`
+
+[`learning-study/`](learning-study/README.md) asks the other half of the
+question. The evolution study establishes that the data changes; this one asks
+whether NeuroPress's online SGD notices — sixteen runs, four workloads ×
+{balanced, ratio-only cost} × {learning on, off}, exploration off throughout so
+the model trains only on the action it actually picked.
+
+The learning-off arms are the point: a prediction error that falls over a run
+proves nothing on its own, because the data gets easier or harder by itself.
+In 7 of 8 arms the learning run crosses the SGD gate far less often than its
+own control.
 
 ---
 
@@ -203,8 +240,8 @@ any `run_config.sh` with no physics arguments gives the studied configuration.
 `BENCHMARK.md` §6 summarises all four, and each README's "Parameters tested"
 table carries its own outcome numbers, so the reasoning is self-contained.
 
-The 26-configuration sweep those choices were made from has been cleared from
-`evolution-study/` pending a new campaign at larger scale. It is still in git —
-`git show 256e7c2c` — and `git checkout -- paper-benchmark/evolution-study/`
-restores it, including the WarpX configuration disqualified on physics rather
-than on score.
+The 26-configuration sweep those choices were made from was cleared in
+`6ce4226f` when the 2,000-step campaign now in `evolution-study/` replaced it.
+It is still in git — `git show 256e7c2c` — and `git checkout 6ce4226f~1 --
+paper-benchmark/evolution-study/` restores it, including the WarpX
+configuration disqualified on physics rather than on score.

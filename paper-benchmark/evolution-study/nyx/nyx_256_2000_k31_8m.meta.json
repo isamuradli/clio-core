@@ -1,0 +1,7 @@
+{"config":"explore-balance","tag":"nyx_k31","rc":0,"mode":"lossy",
+ "cost_model":"balance","bw_bytes_per_ms":5e6,
+ "error_bound":1e-3,"explore_k":31,"explore_thresh":0,"device":"gpu","workload":"nyx-sedov",
+ "atoms":0,"steps":2000,"gap":0,"frames":51,
+ "chunk":8388608,"files":306,"payload_bytes":20535313906,"wall_s":556.08,
+ "verified":1,"port":54783,
+ "physics":{"problem":"sedov","precision":"float32"}}

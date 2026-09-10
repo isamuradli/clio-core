@@ -16,6 +16,10 @@
 #   dynamic        NeuroPress inference, default balanced cost model
 #   dynamic-ratio  same, latency weights zeroed (ratio-only objective)
 #   learn          dynamic + online SGD from measured outcomes
+#   learn-ratio    learn, latency weights zeroed -- online SGD against a
+#                  ratio-only objective. The learning arm's second half:
+#                  `learn` trains on the balanced cost, this one on the
+#                  same measurements scored purely by bytes saved.
 #   explore        ratio-only ranking, top-K alternatives measured, winner kept
 #   best           best mode: exhaustive, ratio-only
 #   static-zstd    fixed nvcomp-zstd, no shuffle
@@ -28,7 +32,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 case "${1:-}" in
-  -h|--help) sed -n '2,24p' "$0"; exit 0;;
+  -h|--help) sed -n '2,28p' "$0"; exit 0;;
 esac
 CONFIG=${1:-dynamic}; shift || true
 
@@ -104,6 +108,7 @@ case "$CONFIG" in
   dynamic)        ;;
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
   learn)          NP_LEARN=true ;;
+  learn-ratio)    NP_LEARN=true; COST_ENV=("${RATIO_ONLY[@]}") ;;
   explore)        NP_LEARN=true; NP_EXPLORE=true; EXPLORE_K=31; THRESH=0
                   COST_ENV=("${RATIO_ONLY[@]}") ;;
   best)           BEST=true ;;
@@ -149,7 +154,7 @@ case "$CONFIG" in
       nvcomp-*)                  STATIC_LIB=$_spec ;;
       *)                         STATIC_LIB=nvcomp-$_spec ;;
     esac ;;
-  *) echo "unknown config: $CONFIG" >&2; sed -n '2,24p' "$0" >&2; exit 2;;
+  *) echo "unknown config: $CONFIG" >&2; sed -n '2,28p' "$0" >&2; exit 2;;
 esac
 export NP_LEARN NP_EXPLORE EXPLORE_K THRESH BEST STATIC_LIB STATIC_SHUF STATIC_QUANT
 

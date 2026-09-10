@@ -160,6 +160,7 @@ case "$CONFIG" in
   dynamic)        ;;
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
   learn)          NP_LEARN=true ;;
+  learn-ratio)    NP_LEARN=true; COST_ENV=("${RATIO_ONLY[@]}") ;;
   explore)        NP_LEARN=true; NP_EXPLORE=true; EXPLORE_K=31; THRESH=0
                   COST_ENV=("${RATIO_ONLY[@]}") ;;
   best)           BEST=true ;;

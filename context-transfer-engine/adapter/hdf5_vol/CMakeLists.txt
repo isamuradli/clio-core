@@ -34,6 +34,11 @@ target_include_directories(clio_hdf5_vol PRIVATE
     # config-string grammar is shared between the two connectors and must not be
     # duplicated: one CLIO config dialect, one parser.
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    # clio_cte_compressor_client is linked below, but its own include directory
+    # is PRIVATE, so consumers do not inherit it. clio_vol.cc includes
+    # clio_cte/compressor/compressor_client.h directly and needs the path
+    # spelled out here.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../compressor/include
     ${HDF5_INCLUDE_DIRS}
     ${HDF5_C_INCLUDE_DIRS}
 )

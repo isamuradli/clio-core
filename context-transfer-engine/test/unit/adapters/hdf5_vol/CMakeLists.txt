@@ -273,13 +273,11 @@ if(NOT WIN32 AND CLIO_CORE_ENABLE_CUDA)
   install(TARGETS test_hdf5_vol_gpu_ptr RUNTIME DESTINATION bin)
 endif()
 
-set_tests_properties(cte_hdf5_vol_compressor_write
-                     cte_hdf5_vol_compressor_devread PROPERTIES
-    TIMEOUT 300
-    LABELS "unit;adapter;hdf5_vol;cte;compressor;693"
-    RESOURCE_LOCK "clio_runtime"
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
-)
+# The two compressor tests these properties belonged to were removed with
+# test_hdf5_vol_compressor_write.cc. set_tests_properties on a test that was
+# never added is a hard configure error, and it went unnoticed because the VOL
+# adapter itself could not build: CLIO_CTE_ENABLE_HDF5_VOL was OFF for want of
+# HDF5 >= 1.14.
 
 install(
     TARGETS test_hdf5_vol_adapter test_hdf5_vol_io
