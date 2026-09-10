@@ -24,7 +24,22 @@ survives is enough to regenerate every figure.
 <workload>/<run>_k31_*.blobs.csv.gz  one row per stored chunk of the K=31
                                  exploration run -- codec, ratio, bytes
 <workload>/<run>_k31_*.meta.json     that run's parameters, self-describing
+logs/<workload>_k31.stdout.log.gz    the run's console output -- chunk count,
+                                     bytes in/out, achieved ratio, wall time
+logs/<workload>_k31.runtime.log.gz   the runtime's own log for the same run
 ```
+
+The logs are copied here because for two of the four runs there is nowhere
+else durable: Nyx's `results/` store was cleaned, and VPIC's lives only in a
+session scratch directory that gets deleted. LAMMPS' and WarpX's stores do
+survive on this machine under `../<workload>/results/<tag>/`, but they are
+gitignored and hold 3.3 GB and 28 GB of tier images respectively, so nothing
+in git depended on them either.
+
+**WarpX has no `runtime.log.gz`.** Its runtime log is 49 MB of NeuroPress path
+trace -- 4.3 MB gzipped, 98% of everything here put together. It is a debug
+trace rather than provenance, and the thing it was used for, reconstructing the
+per-chunk blob record, is already kept as `warpx/warpx_2000_k31_1m.blobs.csv.gz`.
 
 The `_4m` / `_8m` / `_1m` suffix is the chunk size. WarpX is 1 MiB and that is
 a correctness condition, not a preference: openPMD emits each AMReX box as a
@@ -72,18 +87,52 @@ the parameters of the run beside it, so a file is readable without them.
 
 ## The figures
 
-Rendered into each workload's own `../<workload>/viz/`:
+Beside the data they were computed from, not in the workload directories:
 
 ```
-fig3.png    activity is spatially localized (no LAMMPS -- it has no grid)
-fig4.png    compression varies within one dump
-fig5.png    the same evolution measurement across the four workloads
-fields_fig.png                one field at begin / middle / end
-evolution_begin_middle_end.png   the same with a shared colour scale
+<workload>/fig3.png    activity is spatially localized
+<workload>/fig4.png    compression varies within one dump
+<workload>/fields_fig.png                one field at begin / middle / end
+<workload>/evolution_begin_middle_end.png   the same, shared colour scale
+fig5.png               the evolution measurement across all FOUR workloads
 ```
+
+`fig5.png` is at the top level because it is one figure spanning every
+workload, computed from the four `.json` summaries below it. It used to sit in
+each workload's directory as four byte-identical copies.
+
+LAMMPS has no `fig3.png`: atom coordinates have no grid to localize activity
+on, which is the same reason it has no `.slices.npz`.
+
+`<workload>/viz/` is NOT where these live. That directory is each workload's
+`visualize.sh` render target -- scratch output regenerated on every run, and
+documented as such in the workload READMEs. Curated study figures and a
+script's working directory should not be the same place.
 
 `../plot/paper_figures.py {fig3,fig4,fig5,fields}` draws them; pass
 `--slices <run>.slices.npz` to use the cache instead of the deleted dumps.
+
+## Regenerating
+
+```bash
+PYTHON=<interpreter with matplotlib and numpy> ./regenerate.sh [OUTDIR]
+```
+
+With no OUTDIR it overwrites the figures in place; pass a scratch path to
+render elsewhere and diff first. Verified: a second run reproduces every one
+byte-identically.
+
+**`<workload>/evolution_begin_middle_end.png` is NOT regenerable** and
+`regenerate.sh` does not attempt it. That figure reads the dumps
+(`../plot/figure_evolution.py --dir`), and the dumps were deleted after
+measuring. The five mid-plane slices in `<workload>.slices.npz` cover fig3's
+top row and nothing else.
+
+One provenance gap worth knowing: **the `.npz` files do not record which field
+they hold.** They store five arrays named `s0`..`s4`, so the variable the fig3
+top row shows cannot be recovered from them. `regenerate.sh` pins it per
+workload instead, and the values there were recovered by matching each
+committed figure's bottom row against every field in `blocks.csv.gz`.
 
 ## Sibling
 

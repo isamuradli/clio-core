@@ -172,8 +172,13 @@ after measuring.
 | figure | source file | what it gives |
 |---|---|---|
 | **Fig. 3** — activity is spatially localized | `evolution-study/nyx/nyx_128_1000.blocks.csv.gz` | group `pct_cells_same` by block index, density field, last frame pair → outermost 85.6%, central 26.7% |
-| **Fig. 4** — compression varies within one dump | `evolution-study/nyx/nyx_256_2000_k31_4m.blobs.csv.gz` | 1102× maximum within-dump ratio spread, 484× median over 51 dumps; all 51 assigned more than one codec |
+| **Fig. 4** — compression varies within one dump | `evolution-study/nyx/nyx_256_2000_k31_4m.blobs.csv.gz` | 1039× spread within one dump (1724.6× down to 1.66×), 244× median over 306 dumps; 303 of 306 assigned more than one codec |
 | **Fig. 5** — the same measurement on four workloads | `evolution-study/{nyx/nyx_128_1000, vpic/vpic_126_2000, lammps/lammps_2000, warpx/warpx_2000}.json` | the `interval_means` and `interval_pct_cells_same` series in each |
+
+A "dump" in Fig. 4 is one **field at one timestep**, which is how
+`paper_figures.py` keys it -- Nyx's six fields over 51 steps give 306. Grouping
+by timestep alone instead lumps all six fields together and inflates both the
+maximum and the median, so the two counts are not interchangeable.
 
 Fig. 5's four summaries, as the figure plots them:
 
@@ -189,15 +194,21 @@ it. LAMMPS at a flat 0.0% is not a bug: atom coordinates are continuous floats
 that move every step, so no cell is ever bit-identical, and LAMMPS has no Fig. 3
 for the same reason — there is no grid to localize activity on.
 
-The rendered figures are in each workload's own `<workload>/viz/`:
+The rendered figures sit beside the data, in `evolution-study/`:
 
 ```
-fig3.png  fig4.png  fig5.png            the three above
-fields_fig.png                          one field at begin / middle / end
-evolution_begin_middle_end.png          the same on one shared colour scale
+evolution-study/<workload>/fig3.png  fig4.png    the first two above
+evolution-study/fig5.png                         the third -- one figure over
+                                                 all four workloads, so one copy
+evolution-study/<workload>/fields_fig.png
+evolution-study/<workload>/evolution_begin_middle_end.png
 ```
 
-`plot/paper_figures.py {fig3,fig4,fig5,fields}` draws them. Pass
+Not `<workload>/viz/` -- that is each workload's `visualize.sh` render target,
+regenerated on every run.
+
+`evolution-study/regenerate.sh` rebuilds all of them from that directory
+alone; `plot/paper_figures.py {fig3,fig4,fig5,fields}` is what it drives. Pass
 `--slices <run>.slices.npz` to read the cached mid-planes instead of the
 deleted dumps — 100–300 KB standing in for 4.8–26 GB, and byte-identical
 output. Pass `--shape NX,NY,NZ` for a non-cubic grid: WarpX's 64×64×512 has
